@@ -1,19 +1,18 @@
 # streamlit_app_v6_7.py
 # v6.7 — E0–E2, halvgarderingar, tipsrad + "Fredagsanalys" (GPT)
-# Cloud-redo: caching, snabb-träning, robust dataladdning
-# - Ingen E3
-# - OPENAI_API_KEY hämtas från Streamlit Secrets
+# Cloud-redo med robust nedladdning (timeout + retries) så appen aldrig fastnar.
 
 import os
 import json
+import time
 from datetime import datetime
-from urllib.request import urlretrieve
 from collections import defaultdict, deque
 
 import pandas as pd
 import numpy as np
 import streamlit as st
 import joblib
+import requests
 
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
@@ -54,14 +53,39 @@ with st.sidebar:
     st.caption("Tips: Bygg om appen efter midnatt i augusti om ny säsong startar.")
 
 # =======================
-# Datahämtning (cache)
+# HTTP-klient med retries/timeouts
 # =======================
-@st.cache_data(ttl=6*3600, show_spinner=False)
+SESSION = requests.Session()
+ADAPTER = requests.adapters.HTTPAdapter(max_retries=3)  # auto-retry på nätfel
+SESSION.mount("https://", ADAPTER)
+SESSION.mount("http://", ADAPTER)
+
+def _http_get(url: str, timeout: float = 10.0) -> bytes | None:
+    try:
+        r = SESSION.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
+
+@st.cache_data(ttl=6*3600, show_spinner=True)
 def _download_one(league: str, s_code: str) -> str | None:
+    """Ladda ner en ligafil med timeout & retries. Hänger aldrig oändligt."""
     target = os.path.join(DATA_DIR, f"{league}_{s_code}.csv")
     url = f"{BASE_URL}/{s_code}/{league}.csv"
+    data = _http_get(url, timeout=10.0)
+    if data is None:
+        # extra backoff
+        for delay in (1, 2, 4):
+            time.sleep(delay)
+            data = _http_get(url, timeout=10.0)
+            if data is not None:
+                break
+    if data is None:
+        return None
     try:
-        urlretrieve(url, target)
+        with open(target, "wb") as f:
+            f.write(data)
         return target
     except Exception:
         return None
@@ -73,6 +97,10 @@ def download_files(leagues=tuple(LEAGUES), s_code: str = SEASON):
         p = _download_one(L, s_code)
         if p and os.path.exists(p):
             paths.append(p)
+        else:
+            st.warning(f"Kunde inte hämta {L} {s_code} (timeout/blockerat).")
+    if not paths:
+        st.error("Ingen liga kunde hämtas. Testa senare eller byt nät.")
     return tuple(paths)
 
 @st.cache_data(ttl=6*3600, show_spinner=False)
@@ -163,15 +191,20 @@ def _quick_train(df, feature_cols):
     else:
         params = dict(n_estimators=200, max_depth=5, learning_rate=0.1, subsample=0.9, reg_lambda=1.0)
 
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=min(0.2, max(0.1, 200/len(X))) if len(X) > 200 else 0.2, random_state=42, stratify=y)
-    model = XGBClassifier(**params, objective="multi:softprob", num_class=3, n_jobs=-1)
-    # Enkel early stopping utan cross-val (snabbare i Cloud)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y,
+        test_size=min(0.2, max(0.1, 200/len(X))) if len(X) > 200 else 0.2,
+        random_state=42, stratify=y
+    )
+    model = XGBClassifier(
+        **params, objective="multi:softprob", num_class=3,
+        n_jobs=1  # säkrare i begränsad Cloud-miljö
+    )
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     return model
 
 @st.cache_resource(show_spinner=True)
 def load_or_train_model(df_signature: tuple[int, int] | None, df: pd.DataFrame, feature_cols: list[str]):
-    # För Cloud: använd fil om den finns, annars snabb-träna och spara
     if os.path.exists(MODEL_FILE):
         try:
             return joblib.load(MODEL_FILE)
@@ -231,7 +264,7 @@ def pick_half_guards(match_probs, n_half):
     margins = []
     for i, p in enumerate(match_probs):
         if p is None or len(p) != 3 or np.sum(p) == 0:
-            margins.append((i, 1.0))  # hoppa över skräp
+            margins.append((i, 1.0))
             continue
         s = np.sort(p)
         margin = s[-1] - s[-2]
@@ -291,9 +324,11 @@ Svara med 3 korta punkter:
 # =======================
 # Huvudflöde
 # =======================
+st.sidebar.write("Hämtar data…")
 files = download_files(LEAGUES, SEASON)
-df_raw = load_all_data(files)
+st.sidebar.write("Filer klara:", len(files))
 
+df_raw = load_all_data(files)
 if df_raw.empty:
     st.error("Ingen data nedladdad. Kontrollera att football-data.co.uk är uppe eller testa senare.")
     st.stop()
@@ -315,7 +350,6 @@ if not teams_all:
     st.stop()
 
 with st.sidebar:
-    st.write("Filer:", len(files))
     st.write("Lag:", len(teams_all))
     st.write("OPENAI:", "OK" if st.secrets.get("OPENAI_API_KEY") else "—")
 
