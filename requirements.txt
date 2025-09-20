@@ -5,3 +5,10 @@ scikit-learn
 xgboost
 joblib
 openai
+streamlit==1.38.0
+pandas==2.2.2
+numpy<2
+scikit-learn==1.4.2
+xgboost==2.0.3
+joblib==1.3.2
+openai>=1.37.0
