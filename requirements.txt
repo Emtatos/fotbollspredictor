@@ -4,10 +4,5 @@ scikit-learn
 joblib
 filelock
 numpy
-streamlit
-pandas
-scikit-learn
-joblib
-filelock
-numpy
 xgboost
+
