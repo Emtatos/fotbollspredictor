@@ -2,10 +2,6 @@
 # v6.6 — E0–E3 fasta lag per säsong, engångskoll från football-data,
 # alfabetisk gemensam laglista, halvgarderingar + tipsrad.
 # Standard: 13 matcher & 7 halvgarderingar (ändringsbart).
-import streamlit as st
-import openai
-
-openai.api_key = st.secrets["OPENAI_API_KEY"]
 
 import os
 import json
