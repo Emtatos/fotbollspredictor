@@ -1,10 +1,8 @@
 # streamlit_app_simple.py
 # Enkel, komplett Streamlit-app för v5-uppgradering (endast-en-fil)
 # Kör: streamlit run streamlit_app_simple.py
-# OBS: fungerar lokalt och i Colab (med små ändringar). Spara filen i en tom mapp.
 
 import os
-import io
 import json
 from datetime import datetime
 from urllib.request import urlretrieve
@@ -35,7 +33,6 @@ MODEL_FILE = os.path.join(MODEL_DIR, "model.pkl")
 # Hjälpfunktioner
 # -----------------------
 def season_code():
-    # t.ex. 2425 för 2024/25
     y = datetime.now().year % 100
     prev = y - 1
     return f"{prev:02d}{y:02d}"
@@ -59,7 +56,6 @@ def download_files(leagues=("E0","E1"), force=False):
     return got
 
 def read_csv_safe(path):
-    # försök flera encodningar
     for enc in ("utf-8", "latin1", "cp1252"):
         try:
             return pd.read_csv(path, encoding=enc)
@@ -77,49 +73,44 @@ def load_all_data(files):
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 def safe_match_id(row):
-    # YYYY-MM-DD_HOME_AWAY_LEAGUE (inga mellanslag)
     date = pd.to_datetime(row.get("Date", ""), dayfirst=True, errors="coerce")
-    if pd.isna(date):
-        date_str = "unknown-date"
-    else:
-        date_str = date.strftime("%Y-%m-%d")
+    date_str = "unknown-date" if pd.isna(date) else date.strftime("%Y-%m-%d")
     home = str(row.get("HomeTeam","")).replace(" ", "_")
     away = str(row.get("AwayTeam","")).replace(" ", "_")
     league = str(row.get("League","UNK"))
     return f"{date_str}_{home}_{away}_{league}"
 
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
 # -----------------------
-# Enkel feature-beredning
+# Feature-beredning
 # -----------------------
 def prepare_features(df):
-    # Säkerställ nödvändiga kolumner
     expect = ["Date","HomeTeam","AwayTeam","FTHG","FTAG","FTR","League"]
     for c in expect:
         if c not in df.columns:
             df[c] = np.nan
 
-    # Konvertera datum
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-
-    # Skapa enkla features: mål hemma, mål borta, mål-diff
     df["HomeGoals"] = pd.to_numeric(df["FTHG"], errors="coerce").fillna(0)
     df["AwayGoals"] = pd.to_numeric(df["FTAG"], errors="coerce").fillna(0)
     df["GoalDiff"] = df["HomeGoals"] - df["AwayGoals"]
 
-    # Label: FTR (H/D/A) -> 0,1,2
     df = df.dropna(subset=["FTR"], how="all").copy()
     mapping = {"H":0, "D":1, "A":2}
     df["ResultLabel"] = df["FTR"].map(mapping)
 
-    # Extra: normalisera mål per league (enkel z-score)
     for col in ["HomeGoals", "AwayGoals", "GoalDiff"]:
-        df[col + "_norm"] = df.groupby("League")[col].transform(lambda x: (x - x.mean()) / (x.std() if x.std()!=0 else 1))
+        df[col + "_norm"] = df.groupby("League")[col].transform(
+            lambda x: (x - x.mean()) / (x.std() if x.std()!=0 else 1)
+        )
 
     feature_cols = ["HomeGoals_norm","AwayGoals_norm","GoalDiff_norm"]
     return df, feature_cols
 
 # -----------------------
-# Modell: träna/ladda/predict
+# Modell
 # -----------------------
 def train_model(df, feature_cols):
     X = df[feature_cols].fillna(0)
@@ -155,15 +146,13 @@ def load_model():
     return None
 
 def predict_probs(model, feature_vector):
-    # feature_vector: lista/np.array i rätt ordning
     probs = model.predict_proba([feature_vector])[0]
     classes = model.classes_
-    # map classes (0,1,2) -> '1','X','2'
     label_map = {0:"1",1:"X",2:"2"}
     return {label_map[c]: float(p) for c,p in zip(classes,probs)}
 
 # -----------------------
-# Loggning (med fil-lås)
+# Loggning
 # -----------------------
 def append_csv_atomic(path, df):
     lock = FileLock(path + ".lock")
@@ -194,17 +183,22 @@ def read_logs():
     results = pd.read_csv(RESULT_LOG) if os.path.exists(RESULT_LOG) else pd.DataFrame()
     return tips, results
 
+def reset_logs():
+    for path in (TIP_LOG, RESULT_LOG):
+        lock = FileLock(path + ".lock")
+        with lock:
+            if os.path.exists(path):
+                os.remove(path)
+
 # -----------------------
-# Automatisk uppdatering av resultat
+# Resultat-hantering
 # -----------------------
 def auto_update_results(df):
     tips, results = read_logs()
     if tips.empty:
         return 0
     updated = 0
-    # build quick lookup of existing result match_ids
     existing = set(results["match_id"].tolist()) if not results.empty else set()
-    # standardisera Date in df
     df = df.copy()
     df["Date_str"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
     df["match_id"] = df.apply(safe_match_id, axis=1)
@@ -212,25 +206,22 @@ def auto_update_results(df):
         mid = t["match_id"]
         if mid in existing:
             continue
-        # försök hitta i df på match_id
         found = df[df["match_id"] == mid]
         if not found.empty and "FTR" in found.columns:
             ftr = found.iloc[0]["FTR"]
             if pd.notna(ftr) and ftr in ("H","D","A"):
-                # spara som '1','X','2' för result
                 res = "1" if ftr=="H" else "X" if ftr=="D" else "2"
                 log_result(mid, res)
                 updated += 1
     return updated
 
 # -----------------------
-# Utvärdering av träffsäkerhet
+# Utvärdering
 # -----------------------
 def evaluate_performance():
     tips, results = read_logs()
     if tips.empty or results.empty:
         return None, None
-    # expand probs JSON -> leave as text for now
     merged = tips.merge(results, on="match_id", how="inner")
     if merged.empty:
         return None, None
@@ -241,39 +232,31 @@ def evaluate_performance():
     return merged, {"total": total, "correct": int(correct), "accuracy": float(accuracy)}
 
 # -----------------------
-# Enkel migrering av gammalt tip_log.csv (valfritt)
-# -----------------------
-def migrate_old_drive_file(drive_path):
-    # Om du har en gammal drive-fil med kolumner home_team/away_team etc.
-    if not os.path.exists(drive_path):
-        return 0
-    try:
-        old = pd.read_csv(drive_path)
-    except Exception:
-        return 0
-    migrated = 0
-    for _, r in old.iterrows():
-        # gör match_id om möjligt
-        try:
-            date = pd.to_datetime(r.get("timestamp", r.get("Date", "")), errors="coerce")
-            date_str = date.strftime("%Y-%m-%d") if not pd.isna(date) else "unknown-date"
-        except Exception:
-            date_str = "unknown-date"
-        home = r.get("home_team", r.get("home", "")).replace(" ", "_")
-        away = r.get("away_team", r.get("away", "")).replace(" ", "_")
-        league = r.get("league","UNK")
-        mid = f"{date_str}_{home}_{away}_{league}"
-        tip = r.get("predicted", r.get("tip", ""))
-        probs = {"1": r.get("p1",0), "X": r.get("pX",0), "2": r.get("p2",0)}
-        log_tip(mid, home, away, tip, probs)
-        migrated += 1
-    return migrated
-
-# -----------------------
 # Streamlit UI
 # -----------------------
 st.set_page_config(page_title="Fotboll v5 - Enkel", layout="wide")
 st.title("Fotboll v5 — Enkel uppgradering (endast-en-fil)")
+
+# --- Verktyg / Admin ---
+with st.expander("⚙️ Verktyg"):
+    st.write("Snabbverktyg för nedladdning och hantering.")
+    confirm_reset = st.checkbox("Jag förstår att loggarna raderas permanent (tips.csv & results.csv).")
+    if st.button("🗑️ Nollställ loggar", disabled=not confirm_reset):
+        reset_logs()
+        st.success("Loggar nollställda.")
+
+    if os.path.exists(MODEL_FILE):
+        with open(MODEL_FILE, "rb") as f:
+            st.download_button(
+                "📥 Ladda ner modell.pkl",
+                data=f,
+                file_name="model.pkl",
+                mime="application/octet-stream",
+                key="dl_model_pkl"
+            )
+        if st.button("🗑️ Ta bort sparad modell.pkl"):
+            os.remove(MODEL_FILE)
+            st.success("Modell borttagen från disk.")
 
 col1, col2 = st.columns([1,2])
 
@@ -286,13 +269,6 @@ with col1:
     else:
         files = download_files(tuple(leagues))
     st.write("Data-filer:", files)
-
-    # Migrera gammal drive-fil? (valfritt)
-    st.subheader("Migrera gammal tip_log (valfritt)")
-    drive_path = st.text_input("Sökväg till gammalt tip_log.csv (om du har)", "")
-    if st.button("Migrera (om fil finns)"):
-        migrated = migrate_old_drive_file(drive_path.strip())
-        st.success(f"Migrerade {migrated} rader (om fil fanns).")
 
 with col2:
     st.header("Modell")
@@ -309,7 +285,7 @@ with col2:
         else:
             st.success("✅ Modell laddad från disk")
 
-# Prediction UI
+# Prediction
 st.header("Prediktion & loggning")
 if 'model' not in locals():
     model = load_model()
@@ -317,12 +293,18 @@ if 'model' not in locals():
 if df is None or df.empty:
     st.info("Ingen data för prediktion — ladda data först.")
 else:
-    # Visa senaste matcher som val
-    sample_list = df_prep[["Date","HomeTeam","AwayTeam","League"]].dropna().drop_duplicates().tail(50)
-    sample_list = sample_list.reset_index(drop=True)
-    choice_idx = st.selectbox("Välj rad att tippa (senaste 50):", sample_list.index, format_func=lambda i: f"{sample_list.loc[i,'Date'].date()} {sample_list.loc[i,'HomeTeam']} - {sample_list.loc[i,'AwayTeam']} ({sample_list.loc[i,'League']})")
+    sample_list = df_prep[["Date","HomeTeam","AwayTeam","League"]].dropna().drop_duplicates().tail(50).reset_index(drop=True)
+    choice_idx = st.selectbox(
+        "Välj rad att tippa (senaste 50):",
+        sample_list.index,
+        format_func=lambda i: f"{sample_list.loc[i,'Date'].date()} {sample_list.loc[i,'HomeTeam']} - {sample_list.loc[i,'AwayTeam']} ({sample_list.loc[i,'League']})"
+    )
     chosen = sample_list.loc[choice_idx]
-    chosen_row = df_prep[(df_prep["Date"]==chosen["Date"]) & (df_prep["HomeTeam"]==chosen["HomeTeam"]) & (df_prep["AwayTeam"]==chosen["AwayTeam"])].iloc[0]
+    chosen_row = df_prep[
+        (df_prep["Date"]==chosen["Date"]) &
+        (df_prep["HomeTeam"]==chosen["HomeTeam"]) &
+        (df_prep["AwayTeam"]==chosen["AwayTeam"])
+    ].iloc[0]
     st.write("Vald match:", chosen_row["HomeTeam"], "vs", chosen_row["AwayTeam"], "på", chosen_row["Date"])
     if model is None:
         st.info("Träna modellen innan du predikterar.")
@@ -336,7 +318,7 @@ else:
             log_tip(mid, chosen_row["HomeTeam"].replace(" ","_"), chosen_row["AwayTeam"].replace(" ","_"), tip, probs)
             st.success("Tipset loggat!")
 
-# Auto-update results
+# Result & evaluation
 st.header("Resultat & utvärdering")
 if st.button("🔁 Kör automatisk uppdatering av resultat"):
     df_loaded = load_all_data(files)
@@ -344,26 +326,52 @@ if st.button("🔁 Kör automatisk uppdatering av resultat"):
     st.success(f"Uppdaterade {updated} tips med riktiga resultat (om några fanns).")
 
 tips_df, results_df = read_logs()
+
 st.subheader("Tips (senaste 10)")
 if not tips_df.empty:
     st.dataframe(tips_df.tail(10))
+    st.download_button(
+        "⬇️ Ladda ner hela tips.csv",
+        data=df_to_csv_bytes(tips_df),
+        file_name="tips.csv",
+        mime="text/csv",
+        key="dl_tips_csv"
+    )
 else:
     st.write("Inga tips ännu.")
 
 st.subheader("Resultat (senaste 10)")
 if not results_df.empty:
     st.dataframe(results_df.tail(10))
+    st.download_button(
+        "⬇️ Ladda ner hela results.csv",
+        data=df_to_csv_bytes(results_df),
+        file_name="results.csv",
+        mime="text/csv",
+        key="dl_results_csv"
+    )
 else:
     st.write("Inga resultat ännu.")
 
-# Performance
 st.header("Träffsäkerhet")
 merged, stats = evaluate_performance()
 if stats is None:
     st.info("Ingen träffstatistik att visa ännu (behöver både tips och resultat).")
 else:
-    st.metric("Antal tippar med facit", stats["total"])
-    st.metric("Rätt", stats["correct"])
-    st.metric("Träffsäkerhet (%)", f"{stats['accuracy']:.1f}")
+    met1, met2, met3 = st.columns(3)
+    with met1:
+        st.metric("Antal tippar med facit", stats["total"])
+    with met2:
+        st.metric("Rätt", stats["correct"])
+    with met3:
+        st.metric("Träffsäkerhet (%)", f"{stats['accuracy']:.1f}")
+
     st.subheader("Senaste tips med facit")
     st.dataframe(merged.tail(10))
+    st.download_button(
+        "⬇️ Ladda ner tabellen med facit (merged).csv",
+        data=df_to_csv_bytes(merged),
+        file_name="tips_med_facit.csv",
+        mime="text/csv",
+        key="dl_merged_csv"
+    )
