@@ -1,7 +1,6 @@
-# streamlit_app_v6.py
-# v6: XGBoost + 5-match form + ELO-rating
-# Enkel "fixtures-manual": välj lag från E0/E1/E2-listor och få sannolikheter direkt.
-# Allt (data, features, modell) laddas/tränas automatiskt vid start.
+# streamlit_app_v6_5.py
+# Version 6.5 — Tabellresultat + halvgarderingar + TIPSRADE (kopierbar)
+# Standard: 13 matcher, 7 halvgarderingar
 
 import os
 from datetime import datetime
@@ -38,7 +37,6 @@ def season_code():
     return f"{prev:02d}{y:02d}"
 
 def download_files(leagues=("E0","E1","E2")):
-    """Hämtar alltid senaste CSV för valda ligor (överskriver lokalt för enkelhet)."""
     s = season_code()
     got = []
     for L in leagues:
@@ -64,7 +62,7 @@ def load_all_data(files):
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 # -----------------------
-# Feature engineering
+# Features: 5-match form & ELO
 # -----------------------
 def calculate_5match_form(df):
     df = df.copy()
@@ -80,7 +78,6 @@ def calculate_5match_form(df):
         home, away = row.get("HomeTeam",""), row.get("AwayTeam","")
         fthg, ftag, ftr = row.get("FTHG",0), row.get("FTAG",0), row.get("FTR","D")
 
-        # före match
         if len(home_pts[home]) > 0:
             df.at[i,"HomeFormPts5"] = np.mean(home_pts[home])
             df.at[i,"HomeFormGD5"] = np.mean(home_gd[home])
@@ -88,7 +85,6 @@ def calculate_5match_form(df):
             df.at[i,"AwayFormPts5"] = np.mean(away_pts[away])
             df.at[i,"AwayFormGD5"] = np.mean(away_gd[away])
 
-        # efter match
         hp, ap = (3,0) if ftr=="H" else (1,1) if ftr=="D" else (0,3)
         gd_home, gd_away = fthg - ftag, ftag - fthg
         home_pts[home].append(hp); home_gd[home].append(gd_home)
@@ -114,7 +110,6 @@ def compute_elo(df, K=20):
     return df
 
 def prepare_features(df):
-    # Säkerställ kolumner som Football-Data brukar ha
     expect = ["Date","HomeTeam","AwayTeam","FTHG","FTAG","FTR","League"]
     for c in expect:
         if c not in df.columns:
@@ -148,95 +143,126 @@ def train_model(df, feature_cols):
     search = RandomizedSearchCV(model, param_dist, n_iter=5, cv=3, n_jobs=-1, random_state=42)
     search.fit(X_train,y_train)
     best = search.best_estimator_
-    acc = accuracy_score(y_test, best.predict(X_test))
     joblib.dump(best, MODEL_FILE)
-    st.info(f"XGBoost tränad automatiskt. Test-accuracy: {acc:.2%}")
     return best
 
 def load_or_train_model(df, feature_cols):
     if os.path.exists(MODEL_FILE):
-        st.success("✅ Modell laddad från disk")
         return joblib.load(MODEL_FILE)
     return train_model(df, feature_cols)
 
 def predict_probs(model, features, feature_cols):
     X = pd.DataFrame([features], columns=feature_cols)
-    probs = model.predict_proba(X)[0]
-    return {"1": float(probs[0]), "X": float(probs[1]), "2": float(probs[2])}
+    return model.predict_proba(X)[0]
 
 # -----------------------
-# Hjälp: hämta senaste rad för lag inom viss liga
+# Halvgarderingar
 # -----------------------
-def latest_rows_for_team_league(df_prep, team, league, home=True):
-    if home:
-        sub = df_prep[(df_prep["League"]==league) & (df_prep["HomeTeam"]==team)]
-    else:
-        sub = df_prep[(df_prep["League"]==league) & (df_prep["AwayTeam"]==team)]
-    return sub.sort_values("Date").tail(1)
+def pick_half_guards(match_probs, n_half):
+    if n_half <= 0:
+        return set()
+    margins = []
+    for i, p in enumerate(match_probs):
+        s = np.sort(p)
+        margin = s[-1] - s[-2]
+        margins.append((i, margin))
+    margins.sort(key=lambda x: x[1])
+    return {i for i,_ in margins[:n_half]}
+
+def halfguard_sign(probs):
+    idxs = np.argsort(probs)[-2:]
+    idxs = tuple(sorted(idxs))
+    mapping = {(0,1): "1X", (0,2): "12", (1,2): "X2"}
+    return mapping.get(idxs, "1X")
 
 # -----------------------
 # Streamlit UI
 # -----------------------
-st.set_page_config(page_title="Fotboll v6 — Framtida matcher", layout="wide")
-st.title("⚽ Fotboll v6 — välj kommande matcher per liga (E0, E1, E2)")
+st.set_page_config(page_title="Fotboll v6.5 — Halvgardering + Tipsrad", layout="wide")
+st.title("⚽ Fotboll v6.5 — Tippa matcher + halvgarderingar + tipsrad")
 
 # 1) Data & modell (automatisk)
 leagues = ["E0","E1","E2"]
 files = download_files(tuple(leagues))
 df = load_all_data(files)
 if df.empty:
-    st.error("Ingen data tillgänglig.")
+    st.error("Ingen data.")
     st.stop()
 
 df_prep, feat_cols = prepare_features(df)
-st.caption(f"Matcher i datasetet: {len(df_prep)}")
 model = load_or_train_model(df_prep, feat_cols)
 
-# 2) Liga-sektioner: välj matcher manuellt (enkla listor per liga)
+# Gemensam laglista "Lag (Ex: E0)"
+teams_all = []
 for lg in leagues:
-    st.header(f"💠 {lg} — välj kommande matcher")
-    # Lista lag i just denna liga
-    teams_lg = sorted(
+    teams = sorted(
         set(df_prep[df_prep["League"]==lg]["HomeTeam"].dropna().unique())
         .union(df_prep[df_prep["League"]==lg]["AwayTeam"].dropna().unique())
     )
-    if not teams_lg:
-        st.info(f"Inga lag hittades för {lg}.")
-        continue
+    teams_all.extend([f"{t} ({lg})" for t in teams])
 
-    # Hur många matcher vill du picka i denna liga?
-    n = st.number_input(f"Antal matcher i {lg}", min_value=0, max_value=13, value=3, step=1, key=f"n_{lg}")
+# 2) Inputs
+n_matches = st.number_input("Antal matcher att tippa", 1, 13, value=13)
+n_half = st.number_input("Antal halvgarderingar", 0, n_matches, value=7)
 
-    # Skapa rader med dropdowns
-    pending_pairs = []
-    for i in range(n):
-        c1, c2 = st.columns(2)
-        home = c1.selectbox(f"{lg} — Hemmalag {i+1}", teams_lg, key=f"{lg}_h_{i}")
-        away = c2.selectbox(f"{lg} — Bortalag {i+1}", teams_lg, key=f"{lg}_a_{i}")
-        if home and away and home != away:
-            pending_pairs.append((home, away))
+match_pairs = []
+for i in range(n_matches):
+    c1, c2 = st.columns(2)
+    home = c1.selectbox(f"Hemmalag {i+1}", teams_all, key=f"h_{i}")
+    away = c2.selectbox(f"Bortalag {i+1}", teams_all, key=f"a_{i}")
+    if home and away and home != away:
+        match_pairs.append((home, away))
 
-    # Visa sannolikheter direkt (ingen knapp)
-    if pending_pairs:
-        st.subheader(f"Sannolikheter i {lg}")
-        for idx, (home, away) in enumerate(pending_pairs, start=1):
-            h_row = latest_rows_for_team_league(df_prep, home, lg, home=True)
-            a_row = latest_rows_for_team_league(df_prep, away, lg, home=False)
-            if h_row.empty or a_row.empty:
-                st.write(f"{idx}) {home} - {away}: ingen formdata hittad i {lg}")
-                continue
+# 3) Tippa
+if st.button("Tippa matcher"):
+    rows, match_probs, tecken_list = [], [], []
 
-            features = [
-                float(h_row["HomeFormPts5"].values[0]),
-                float(h_row["HomeFormGD5"].values[0]),
-                float(a_row["AwayFormPts5"].values[0]),
-                float(a_row["AwayFormGD5"].values[0]),
-                float(h_row["HomeElo"].values[0]),
-                float(a_row["AwayElo"].values[0]),
-            ]
-            probs = predict_probs(model, features, feat_cols)
-            st.markdown(f"**{idx}) {home} – {away}**")
-            st.json(probs)
+    for (home, away) in match_pairs:
+        home_team, home_lg = home.rsplit(" (",1)
+        away_team, away_lg = away.rsplit(" (",1)
+        home_team, home_lg = home_team.strip(), home_lg.strip(")")
+        away_team, away_lg = away_team.strip(), away_lg.strip(")")
 
-st.divider()
-st.caption("Tips: välj lag enligt nästa omgång i varje liga (från valfri spelsajt). Modellen använder 5-matchers form och ELO inom respektive liga.")
+        h_row = df_prep[(df_prep["League"]==home_lg) & (df_prep["HomeTeam"]==home_team)].tail(1)
+        a_row = df_prep[(df_prep["League"]==away_lg) & (df_prep["AwayTeam"]==away_team)].tail(1)
+        if h_row.empty or a_row.empty:
+            match_probs.append(np.array([0.0,0.0,0.0]))
+            continue
+
+        features = [
+            float(h_row["HomeFormPts5"].values[0]),
+            float(h_row["HomeFormGD5"].values[0]),
+            float(a_row["AwayFormPts5"].values[0]),
+            float(a_row["AwayFormGD5"].values[0]),
+            float(h_row["HomeElo"].values[0]),
+            float(a_row["AwayElo"].values[0])
+        ]
+        probs = predict_probs(model, features, feat_cols)
+        match_probs.append(probs)
+
+    # Välj halvgarderingar
+    half_idxs = pick_half_guards(match_probs, n_half)
+
+    # Bygg tabell + tipsrad
+    for idx, ((home, away), probs) in enumerate(zip(match_pairs, match_probs), start=1):
+        if probs.sum() == 0:
+            tecken = "?"
+            pct = ""
+        else:
+            if (idx-1) in half_idxs:
+                tecken = f"({halfguard_sign(probs)})"
+                pct = "-"
+            else:
+                pred = int(np.argmax(probs))
+                tecken = f"({['1','X','2'][pred]})"
+                pct = f"{probs[pred]*100:.1f}%"
+        tecken_list.append(tecken)
+        rows.append([idx, "", f"{home} - {away}", tecken, "", "", pct])
+
+    df_out = pd.DataFrame(rows, columns=["#","Status","Match","Tecken","Res.","%","Stats"])
+    st.subheader("Resultat-tabell")
+    st.dataframe(df_out, use_container_width=True)
+
+    st.subheader("Tipsrad (kopiera)")
+    tipsrad = " ".join(tecken_list)
+    st.code(tipsrad, language=None)
