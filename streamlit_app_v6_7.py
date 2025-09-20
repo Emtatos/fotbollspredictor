@@ -1,5 +1,6 @@
 # streamlit_app_v6_7.py
 # v6.7 — E0–E2, halvgarderingar, tipsrad + "Fredagsanalys" (GPT)
+# Cloud-redo: caching, snabb-träning, robust dataladdning
 # - Ingen E3
 # - OPENAI_API_KEY hämtas från Streamlit Secrets
 
@@ -14,7 +15,7 @@ import numpy as np
 import streamlit as st
 import joblib
 
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
 # -------- OpenAI (GPT) ----------
@@ -36,7 +37,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 MODEL_FILE = os.path.join(MODEL_DIR, "model_v6.pkl")
-
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
 LEAGUES = ["E0", "E1", "E2"]  # ⬅️ E3 borttagen
 
@@ -48,32 +48,48 @@ def season_code():
 SEASON = season_code()
 TEAMS_JSON = os.path.join(DATA_DIR, f"teams_{SEASON}.json")
 
-# =======================
-# Datahämtning
-# =======================
-def download_files(leagues=tuple(LEAGUES)):
-    s = season_code()
-    got = []
-    for L in leagues:
-        target = os.path.join(DATA_DIR, f"{L}_{s}.csv")
-        url = f"{BASE_URL}/{s}/{L}.csv"
-        try:
-            urlretrieve(url, target)
-            got.append(target)
-        except Exception as e:
-            st.warning(f"Kunde inte hämta {url}: {e}")
-    return got
+with st.sidebar:
+    st.header("Status")
+    st.write("Säsongskod:", SEASON)
+    st.caption("Tips: Bygg om appen efter midnatt i augusti om ny säsong startar.")
 
-def load_all_data(files):
+# =======================
+# Datahämtning (cache)
+# =======================
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def _download_one(league: str, s_code: str) -> str | None:
+    target = os.path.join(DATA_DIR, f"{league}_{s_code}.csv")
+    url = f"{BASE_URL}/{s_code}/{league}.csv"
+    try:
+        urlretrieve(url, target)
+        return target
+    except Exception:
+        return None
+
+@st.cache_data(ttl=6*3600, show_spinner=True)
+def download_files(leagues=tuple(LEAGUES), s_code: str = SEASON):
+    paths = []
+    for L in leagues:
+        p = _download_one(L, s_code)
+        if p and os.path.exists(p):
+            paths.append(p)
+    return tuple(paths)
+
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def load_all_data(files: tuple[str, ...]) -> pd.DataFrame:
     dfs = []
     for f in files:
         try:
             df = pd.read_csv(f, encoding="latin1")
+            league = os.path.basename(f).split("_")[0]
+            df["League"] = league
+            # Normalisera kolumner som ibland saknas
+            for col in ["Date","HomeTeam","AwayTeam","FTHG","FTAG","FTR"]:
+                if col not in df.columns:
+                    df[col] = np.nan
+            dfs.append(df)
         except Exception:
             continue
-        league = os.path.basename(f).split("_")[0]
-        df["League"] = league
-        dfs.append(df)
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 # =======================
@@ -81,13 +97,13 @@ def load_all_data(files):
 # =======================
 def calculate_5match_form(df):
     df = df.copy()
-    df = df.sort_values("Date").reset_index(drop=True)
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df = df.sort_values(["Date"]).reset_index(drop=True)
 
     home_pts, home_gd = defaultdict(lambda: deque([], maxlen=5)), defaultdict(lambda: deque([], maxlen=5))
     away_pts, away_gd = defaultdict(lambda: deque([], maxlen=5)), defaultdict(lambda: deque([], maxlen=5))
 
-    df["HomeFormPts5"], df["HomeFormGD5"], df["AwayFormPts5"], df["AwayFormGD5"] = 0, 0, 0, 0
+    df["HomeFormPts5"], df["HomeFormGD5"], df["AwayFormPts5"], df["AwayFormGD5"] = 0.0, 0.0, 0.0, 0.0
 
     for i, row in df.iterrows():
         home, away = row.get("HomeTeam",""), row.get("AwayTeam","")
@@ -124,12 +140,10 @@ def compute_elo(df, K=20):
         df.at[i, "HomeElo"], df.at[i, "AwayElo"] = elo[home], elo[away]
     return df
 
-def prepare_features(df):
-    expect = ["Date","HomeTeam","AwayTeam","FTHG","FTAG","FTR","League"]
-    for c in expect:
-        if c not in df.columns:
-            df[c] = np.nan
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def prepare_features(df: pd.DataFrame):
+    if df.empty:
+        return df, []
     df = df.dropna(subset=["FTR"])
     df = calculate_5match_form(df)
     df = compute_elo(df)
@@ -137,31 +151,38 @@ def prepare_features(df):
     return df, feature_cols
 
 # =======================
-# Modell
+# Modell (snabb-träning + cache)
 # =======================
-def train_model(df, feature_cols):
-    X = df[feature_cols].fillna(0)
+def _quick_train(df, feature_cols):
+    X = df[feature_cols].fillna(0.0)
     y = df["FTR"].map({"H":0,"D":1,"A":2}).astype(int)
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Skydda mot för lite data (ny säsong etc.)
+    if len(X) < 100:
+        params = dict(n_estimators=120, max_depth=4, learning_rate=0.15, subsample=1.0, reg_lambda=1.0)
+    else:
+        params = dict(n_estimators=200, max_depth=5, learning_rate=0.1, subsample=0.9, reg_lambda=1.0)
 
-    param_dist = {
-        "n_estimators":[100,200],
-        "max_depth":[3,5,7],
-        "learning_rate":[0.05,0.1,0.2],
-        "subsample":[0.8,1.0]
-    }
-    model = XGBClassifier(use_label_encoder=False, eval_metric="mlogloss")
-    search = RandomizedSearchCV(model, param_dist, n_iter=5, cv=3, n_jobs=-1, random_state=42)
-    search.fit(X_train, y_train)
-    best = search.best_estimator_
-    joblib.dump(best, MODEL_FILE)
-    return best
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=min(0.2, max(0.1, 200/len(X))) if len(X) > 200 else 0.2, random_state=42, stratify=y)
+    model = XGBClassifier(**params, objective="multi:softprob", num_class=3, n_jobs=-1)
+    # Enkel early stopping utan cross-val (snabbare i Cloud)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    return model
 
-def load_or_train_model(df, feature_cols):
+@st.cache_resource(show_spinner=True)
+def load_or_train_model(df_signature: tuple[int, int] | None, df: pd.DataFrame, feature_cols: list[str]):
+    # För Cloud: använd fil om den finns, annars snabb-träna och spara
     if os.path.exists(MODEL_FILE):
-        return joblib.load(MODEL_FILE)
-    return train_model(df, feature_cols)
+        try:
+            return joblib.load(MODEL_FILE)
+        except Exception:
+            pass
+    model = _quick_train(df, feature_cols)
+    try:
+        joblib.dump(model, MODEL_FILE)
+    except Exception:
+        pass
+    return model
 
 def predict_probs(model, features, feature_cols):
     X = pd.DataFrame([features], columns=feature_cols)
@@ -176,25 +197,29 @@ def build_team_labels(df, leagues):
         sub = df[df["League"] == lg]
         teams = set(sub["HomeTeam"].dropna()) | set(sub["AwayTeam"].dropna())
         for t in teams:
+            t = str(t).strip()
             if t:
-                pairs.add((str(t), lg))
+                pairs.add((t, lg))
     labels = [f"{t} ({lg})" for (t, lg) in pairs]
     labels = sorted(labels, key=lambda s: s.lower())
     return labels
 
 def load_or_create_team_labels(df, leagues):
-    if os.path.exists(TEAMS_JSON):
-        try:
+    try:
+        if os.path.exists(TEAMS_JSON):
             with open(TEAMS_JSON, "r", encoding="utf-8") as f:
                 labels = json.load(f)
             if isinstance(labels, list) and labels:
                 return labels
-        except Exception:
-            pass
+    except Exception:
+        pass
     labels = build_team_labels(df, leagues)
     if labels:
-        with open(TEAMS_JSON, "w", encoding="utf-8") as f:
-            json.dump(labels, f, ensure_ascii=False, indent=2)
+        try:
+            with open(TEAMS_JSON, "w", encoding="utf-8") as f:
+                json.dump(labels, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
     return labels
 
 # =======================
@@ -205,15 +230,18 @@ def pick_half_guards(match_probs, n_half):
         return set()
     margins = []
     for i, p in enumerate(match_probs):
+        if p is None or len(p) != 3 or np.sum(p) == 0:
+            margins.append((i, 1.0))  # hoppa över skräp
+            continue
         s = np.sort(p)
-        margin = s[-1] - s[-2]  # liten marginal = osäker → bra kandidat för halvgardering
+        margin = s[-1] - s[-2]
         margins.append((i, margin))
     margins.sort(key=lambda x: x[1])
     return {i for i,_ in margins[:n_half]}
 
 def halfguard_sign(probs):
     idxs = np.argsort(probs)[-2:]
-    idxs = tuple(sorted(idxs))
+    idxs = tuple(sorted(map(int, idxs)))
     mapping = {(0,1): "1X", (0,2): "12", (1,2): "X2"}
     return mapping.get(idxs, "1X")
 
@@ -223,13 +251,7 @@ def halfguard_sign(probs):
 def get_openai_client():
     if not _HAS_OPENAI:
         return None, "openai-biblioteket saknas (lägg till 'openai' i requirements.txt)."
-    api_key = None
-    # Streamlit Cloud: via secrets
-    if "OPENAI_API_KEY" in st.secrets:
-        api_key = st.secrets["OPENAI_API_KEY"]
-    # fallback: miljövariabel lokalt
-    if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY")
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None, "OPENAI_API_KEY saknas (lägg in i Streamlit Secrets)."
     try:
@@ -239,11 +261,6 @@ def get_openai_client():
         return None, f"Kunde inte initiera OpenAI-klient: {e}"
 
 def gpt_match_brief(client, home, away, league, h_form_pts, h_form_gd, a_form_pts, a_form_gd, h_elo, a_elo, p1, px, p2):
-    """
-    Gör en kort briefing utan att hitta på nyheter:
-    - Använd ENBART givna siffror (form, ELO, sannolikheter).
-    - Inga påståenden om skador/rykten/etc.
-    """
     prompt = f"""
 Du är en sportanalytiker. Ge en kort briefing inför matchen {home} - {away} i {league}.
 Använd endast siffrorna nedan (inga påhittade nyheter eller skador):
@@ -255,7 +272,7 @@ Använd endast siffrorna nedan (inga påhittade nyheter eller skador):
 Svara med 3 korta punkter:
 1) Styrkebalans (ELO) och hemmaprofil.
 2) Formkurvor (5 matcher) och vad det antyder.
-3) Kort riskbedömning (t.ex. hög osäkerhet om 2 utfal ligger nära).
+3) Kort riskbedömning (t.ex. hög osäkerhet om 2 utfall ligger nära).
 """
     try:
         resp = client.chat.completions.create(
@@ -274,19 +291,33 @@ Svara med 3 korta punkter:
 # =======================
 # Huvudflöde
 # =======================
-files = download_files()
+files = download_files(LEAGUES, SEASON)
 df_raw = load_all_data(files)
+
 if df_raw.empty:
-    st.error("Ingen data.")
+    st.error("Ingen data nedladdad. Kontrollera att football-data.co.uk är uppe eller testa senare.")
     st.stop()
 
 df_prep, feat_cols = prepare_features(df_raw)
-model = load_or_train_model(df_prep, feat_cols)
+if not feat_cols:
+    st.error("Kunde inte förbereda features (saknas FTR eller bas-kolumner).")
+    st.stop()
+
+# Signatur för cache (ändras om datamängden eller senaste datum ändras)
+latest_ts = int(pd.to_datetime(df_prep["Date"], errors="coerce").max().timestamp()) if "Date" in df_prep.columns else 0
+df_signature = (len(df_prep), latest_ts)
+
+model = load_or_train_model(df_signature, df_prep, feat_cols)
 
 teams_all = load_or_create_team_labels(df_raw, LEAGUES)
 if not teams_all:
     st.warning("Kunde inte skapa laglistan. Kontrollera att minst en match finns i varje liga.")
     st.stop()
+
+with st.sidebar:
+    st.write("Filer:", len(files))
+    st.write("Lag:", len(teams_all))
+    st.write("OPENAI:", "OK" if st.secrets.get("OPENAI_API_KEY") else "—")
 
 # Inputs
 n_matches = st.number_input("Antal matcher att tippa", 1, 13, value=13)
@@ -301,7 +332,7 @@ for i in range(n_matches):
         match_pairs.append((home, away))
 
 # Tippa
-if st.button("Tippa matcher"):
+if st.button("Tippa matcher", use_container_width=True):
     rows, match_probs, tecken_list, match_meta = [], [], [], []
 
     # Beräkna sannolikheter + samla meta
@@ -313,9 +344,10 @@ if st.button("Tippa matcher"):
 
         h_row = df_prep[(df_prep["League"]==home_lg) & (df_prep["HomeTeam"]==home_team)].tail(1)
         a_row = df_prep[(df_prep["League"]==away_lg) & (df_prep["AwayTeam"]==away_team)].tail(1)
+
         if h_row.empty or a_row.empty:
             match_probs.append(np.array([0.0,0.0,0.0]))
-            match_meta.append((home_team, away_team, f"{home_lg}/{away_lg}", 0,0,0,0,0,0))
+            match_meta.append((home_team, away_team, f"{home_lg}", 0,0,0,0,0,0))
             continue
 
         features = [
@@ -328,18 +360,14 @@ if st.button("Tippa matcher"):
         ]
         probs = predict_probs(model, features, feat_cols)
         match_probs.append(probs)
-
-        match_meta.append((
-            home_team, away_team, home_lg,                # visa ligan enligt hemmalagets liga
-            features[0], features[1], features[2], features[3], features[4], features[5]
-        ))
+        match_meta.append((home_team, away_team, home_lg, *features))
 
     # Välj halvgarderingar
     half_idxs = pick_half_guards(match_probs, n_half)
 
     # Tabell + tipsrad
     for idx, ((home_label, away_label), probs, meta) in enumerate(zip(match_pairs, match_probs, match_meta), start=1):
-        if probs.sum() == 0:
+        if probs is None or len(probs)!=3 or float(np.sum(probs)) == 0.0:
             tecken, pct = "?", ""
         else:
             if (idx-1) in half_idxs:
@@ -368,10 +396,10 @@ if st.button("Tippa matcher"):
         else:
             st.caption("Analysen bygger endast på form/ELO/sannolikheter (inga nyheter för att undvika påhitt).")
             for i, (home_team, away_team, lg, hfp, hfgd, afp, afgd, helo, aelo) in enumerate(match_meta, start=1):
-                if match_probs[i-1].sum() == 0:
+                if match_probs[i-1] is None or np.sum(match_probs[i-1]) == 0:
                     st.markdown(f"**{i}) {home_team} ({lg}) - {away_team}**\n*(Ingen data till analys)*")
                     continue
-                p1, px, p2 = match_probs[i-1][0], match_probs[i-1][1], match_probs[i-1][2]
+                p1, px, p2 = match_probs[i-1]
                 summary = gpt_match_brief(
                     client, home_team, away_team, lg,
                     hfp, hfgd, afp, afgd, helo, aelo, p1, px, p2
