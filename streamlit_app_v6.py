@@ -1,8 +1,10 @@
-# streamlit_app_v6_5.py
-# Version 6.5 — Tabellresultat + halvgarderingar + TIPSRADE (kopierbar)
-# Standard: 13 matcher, 7 halvgarderingar
+# streamlit_app_v6_6.py
+# v6.6 — E0–E3 fasta lag per säsong, engångskoll från football-data,
+# alfabetisk gemensam laglista, halvgarderingar + tipsrad.
+# Standard: 13 matcher & 7 halvgarderingar (ändringsbart).
 
 import os
+import json
 from datetime import datetime
 from urllib.request import urlretrieve
 from collections import defaultdict, deque
@@ -13,7 +15,6 @@ import streamlit as st
 import joblib
 
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from sklearn.metrics import accuracy_score
 from xgboost import XGBClassifier
 
 # -----------------------
@@ -27,16 +28,22 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 MODEL_FILE = os.path.join(MODEL_DIR, "model_v6.pkl")
 
 # -----------------------
-# Datahämtning
+# Hjälpare
 # -----------------------
-BASE_URL = "https://www.football-data.co.uk/mmz4281"
-
 def season_code():
     y = datetime.now().year % 100
     prev = y - 1
     return f"{prev:02d}{y:02d}"
 
-def download_files(leagues=("E0","E1","E2")):
+SEASON = season_code()
+TEAMS_JSON = os.path.join(DATA_DIR, f"teams_{SEASON}.json")
+
+# -----------------------
+# Datahämtning
+# -----------------------
+BASE_URL = "https://www.football-data.co.uk/mmz4281"
+
+def download_files(leagues=("E0","E1","E2","E3")):
     s = season_code()
     got = []
     for L in leagues:
@@ -118,27 +125,17 @@ def prepare_features(df):
     df = df.dropna(subset=["FTR"])
     df = calculate_5match_form(df)
     df = compute_elo(df)
-
-    mapping = {"H":0, "D":1, "A":2}
-    df["ResultLabel"] = df["FTR"].map(mapping)
-
-    feature_cols = ["HomeFormPts5","HomeFormGD5","AwayFormPts5","AwayFormGD5","HomeElo","AwayElo"]
-    return df, feature_cols
+    return df, ["HomeFormPts5","HomeFormGD5","AwayFormPts5","AwayFormGD5","HomeElo","AwayElo"]
 
 # -----------------------
 # Modell
 # -----------------------
 def train_model(df, feature_cols):
     X = df[feature_cols].fillna(0)
-    y = df["ResultLabel"].astype(int)
+    y = df["FTR"].map({"H":0,"D":1,"A":2}).astype(int)
     X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2,random_state=42)
 
-    param_dist = {
-        "n_estimators":[100,200],
-        "max_depth":[3,5,7],
-        "learning_rate":[0.05,0.1,0.2],
-        "subsample":[0.8,1.0]
-    }
+    param_dist = {"n_estimators":[100,200],"max_depth":[3,5,7],"learning_rate":[0.05,0.1,0.2],"subsample":[0.8,1.0]}
     model = XGBClassifier(use_label_encoder=False, eval_metric="mlogloss")
     search = RandomizedSearchCV(model, param_dist, n_iter=5, cv=3, n_jobs=-1, random_state=42)
     search.fit(X_train,y_train)
@@ -156,6 +153,38 @@ def predict_probs(model, features, feature_cols):
     return model.predict_proba(X)[0]
 
 # -----------------------
+# Laglista (engångskoll per säsong)
+# -----------------------
+def build_team_labels(df, leagues):
+    """Bygg 'Lag (E#)'-etiketter från E0–E3 och sortera alfabetiskt globalt."""
+    pairs = set()
+    for lg in leagues:
+        sub = df[df["League"] == lg]
+        teams = set(sub["HomeTeam"].dropna()) | set(sub["AwayTeam"].dropna())
+        for t in teams:
+            pairs.add((str(t), lg))
+    labels = [f"{t} ({lg})" for (t, lg) in pairs if t and lg]
+    labels = sorted(labels, key=lambda s: s.lower())
+    return labels
+
+def load_or_create_team_labels(df, leagues):
+    # Om vi redan sparat årets lista – använd den
+    if os.path.exists(TEAMS_JSON):
+        try:
+            with open(TEAMS_JSON, "r", encoding="utf-8") as f:
+                labels = json.load(f)
+            if isinstance(labels, list) and labels:
+                return labels
+        except Exception:
+            pass
+    # Annars bygg från CSV (första gången när matcher finns)
+    labels = build_team_labels(df, leagues)
+    if labels:
+        with open(TEAMS_JSON, "w", encoding="utf-8") as f:
+            json.dump(labels, f, ensure_ascii=False, indent=2)
+    return labels
+
+# -----------------------
 # Halvgarderingar
 # -----------------------
 def pick_half_guards(match_probs, n_half):
@@ -164,7 +193,7 @@ def pick_half_guards(match_probs, n_half):
     margins = []
     for i, p in enumerate(match_probs):
         s = np.sort(p)
-        margin = s[-1] - s[-2]
+        margin = s[-1] - s[-2]  # liten marginal = osäkert = bra kandidat för halvgardering
         margins.append((i, margin))
     margins.sort(key=lambda x: x[1])
     return {i for i,_ in margins[:n_half]}
@@ -178,30 +207,27 @@ def halfguard_sign(probs):
 # -----------------------
 # Streamlit UI
 # -----------------------
-st.set_page_config(page_title="Fotboll v6.5 — Halvgardering + Tipsrad", layout="wide")
-st.title("⚽ Fotboll v6.5 — Tippa matcher + halvgarderingar + tipsrad")
+st.set_page_config(page_title="Fotboll v6.6 — fasta lag E0–E3", layout="wide")
+st.title("⚽ Fotboll v6.6 — E0–E3 fasta lag per säsong (engångskoll)")
 
-# 1) Data & modell (automatisk)
-leagues = ["E0","E1","E2"]
+# 1) Data & modell
+leagues = ["E0","E1","E2","E3"]   # fasta ligor i systemet
 files = download_files(tuple(leagues))
-df = load_all_data(files)
-if df.empty:
+df_raw = load_all_data(files)
+if df_raw.empty:
     st.error("Ingen data.")
     st.stop()
 
-df_prep, feat_cols = prepare_features(df)
+df_prep, feat_cols = prepare_features(df_raw)
 model = load_or_train_model(df_prep, feat_cols)
 
-# Gemensam laglista "Lag (Ex: E0)"
-teams_all = []
-for lg in leagues:
-    teams = sorted(
-        set(df_prep[df_prep["League"]==lg]["HomeTeam"].dropna().unique())
-        .union(df_prep[df_prep["League"]==lg]["AwayTeam"].dropna().unique())
-    )
-    teams_all.extend([f"{t} ({lg})" for t in teams])
+# 2) Laglista (alfabetisk, över alla E0–E3)
+teams_all = load_or_create_team_labels(df_raw, leagues)
+if not teams_all:
+    st.warning("Kunde inte skapa laglistan. Kontrollera att det finns minst en spelad match i varje liga.")
+    st.stop()
 
-# 2) Inputs
+# 3) Inputs
 n_matches = st.number_input("Antal matcher att tippa", 1, 13, value=13)
 n_half = st.number_input("Antal halvgarderingar", 0, n_matches, value=7)
 
@@ -213,7 +239,7 @@ for i in range(n_matches):
     if home and away and home != away:
         match_pairs.append((home, away))
 
-# 3) Tippa
+# 4) Tippa
 if st.button("Tippa matcher"):
     rows, match_probs, tecken_list = [], [], []
 
@@ -240,29 +266,25 @@ if st.button("Tippa matcher"):
         probs = predict_probs(model, features, feat_cols)
         match_probs.append(probs)
 
-    # Välj halvgarderingar
     half_idxs = pick_half_guards(match_probs, n_half)
 
-    # Bygg tabell + tipsrad
     for idx, ((home, away), probs) in enumerate(zip(match_pairs, match_probs), start=1):
         if probs.sum() == 0:
-            tecken = "?"
-            pct = ""
+            tecken, pct = "?", ""
         else:
             if (idx-1) in half_idxs:
-                tecken = f"({halfguard_sign(probs)})"
-                pct = "-"
+                tecken, pct = f"({halfguard_sign(probs)})", "-"
             else:
                 pred = int(np.argmax(probs))
                 tecken = f"({['1','X','2'][pred]})"
                 pct = f"{probs[pred]*100:.1f}%"
-        tecken_list.append(tecken)
+
         rows.append([idx, "", f"{home} - {away}", tecken, "", "", pct])
+        tecken_list.append(tecken)
 
     df_out = pd.DataFrame(rows, columns=["#","Status","Match","Tecken","Res.","%","Stats"])
     st.subheader("Resultat-tabell")
     st.dataframe(df_out, use_container_width=True)
 
     st.subheader("Tipsrad (kopiera)")
-    tipsrad = " ".join(tecken_list)
-    st.code(tipsrad, language=None)
+    st.code(" ".join(tecken_list), language=None)
