@@ -1,12 +1,12 @@
 # streamlit_app_v6_8.py
-# v6.8 — Stabil laglista + normalisering + backfill + tydlig status
+# v6.8 — Stabil laglista + normalisering + backfill + Elo carryover
 # - Laddar E0–E2 (Premier, Championship, League One)
-# - Backfill från förra säsongen för feature-beräkning om nuvarande säsong är tunn
-# - Laglista = nuvarande säsong + MANUAL_INCLUDE/MANUAL_EXCLUDE (ingen gissning)
-# - Namn-normalisering (t.ex. "Bradford", "Bradford C" -> "Bradford City")
-# - Robust nerladdning m. retries/timeout
-# - 0 halvgarderingar som standard
-# - Säker OPENAI-hantering (ingen krasch utan secrets)
+# - Backfill från förra säsongen (E0–E3) för upp-/nedflyttningar
+# - Namn-normalisering (alias)
+# - Laglista bygger på CSV + valfria manuella tillägg (ingen gissning)
+# - Tydliga räknare i sidpanelen
+# - 0 halvgarderingar default
+# - GPT "Fredagsanalys" (frivilligt) om OPENAI_API_KEY finns (Render → Environment)
 
 import os
 import json
@@ -24,7 +24,9 @@ import requests
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
-# -------- OpenAI (GPT) ----------
+# =======================
+# OpenAI (valfritt)
+# =======================
 try:
     from openai import OpenAI
     _HAS_OPENAI = True
@@ -42,34 +44,29 @@ MODEL_DIR = "models"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-MODEL_FILE = os.path.join(MODEL_DIR, "model_v6.pkl")
+MODEL_FILE = os.path.join(MODEL_DIR, "model_v6_8.pkl")
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
-LEAGUES = ["E0", "E1", "E2"]  # Premier, Championship, League One
+MAIN_LEAGUES = ["E0", "E1", "E2"]       # Premier, Championship, League One
+BACKFILL_LEAGUES = ["E0", "E1", "E2", "E3"]  # för föreg. säsong
 
-# ===== Säsongskoder =====
-def season_code(dt: datetime) -> str:
-    y = dt.year % 100
-    prev = y - 1
+def season_code_for_year(year: int) -> str:
+    y = year % 100
+    prev = (year - 1) % 100
     return f"{prev:02d}{y:02d}"
 
-NOW = datetime.now()
-SEASON = season_code(NOW)
-PREV_SEASON = season_code(datetime(NOW.year-1, NOW.month, NOW.day))
+CURR_SEASON = season_code_for_year(datetime.now().year)
+PREV_SEASON = season_code_for_year(datetime.now().year - 1)
 
 # =======================
-# Manuella overrides (inga gissningar)
+# (Valfritt) MANUELLT TILLÄGG TILL LAGLISTAN
+# Lägg lag här om de tillhör divisionen men inte syns i årets CSV än.
+# Ex: Bradford City i E2 enligt din input.
+# Detta kompletterar bara select-listan; data hämtas från CSV/backfill.
 # =======================
-# Här kan du säkra lag som MÅSTE finnas i laglistan för respektive liga (ex. Bradford City i E2).
-MANUAL_INCLUDE = {
-    "E2": {"Bradford City"},   # ← säkrar att Bradford City visas i League One
-    "E1": set(),
-    "E0": set(),
-}
-# Om du vill dölja felplacerade lag i väntan på uppdaterad CSV, lägg dem här:
-MANUAL_EXCLUDE = {
-    "E2": set(),
-    "E1": set(),
-    "E0": set(),
+MANUAL_TEAMS = {
+    "E0": [],
+    "E1": [],
+    "E2": ["Bradford City"],
 }
 
 # =======================
@@ -85,7 +82,6 @@ def _hash_file(path: str) -> str:
 def _norm_space(s: str) -> str:
     return " ".join(str(s).strip().split())
 
-# Namn-normalisering för Football-Data varianter → standardnamn
 TEAM_ALIASES = {
     "Bradford": "Bradford City",
     "Bradford C": "Bradford City",
@@ -150,7 +146,7 @@ def _download_one(league: str, s_code: str) -> str | None:
         return None
 
 @st.cache_data(ttl=6*3600, show_spinner=True)
-def download_files(leagues=tuple(LEAGUES), s_code: str = SEASON):
+def download_files(leagues=tuple(MAIN_LEAGUES), s_code: str = CURR_SEASON):
     paths = []
     for L in leagues:
         p = _download_one(L, s_code)
@@ -162,15 +158,24 @@ def download_files(leagues=tuple(LEAGUES), s_code: str = SEASON):
         st.error("Ingen liga kunde hämtas. Testa senare eller byt nät.")
     return tuple(paths)
 
+@st.cache_data(ttl=6*3600, show_spinner=True)
+def download_prev_season(leagues=tuple(BACKFILL_LEAGUES), s_code: str = PREV_SEASON):
+    paths = []
+    for L in leagues:
+        p = _download_one(L, s_code)
+        if p and os.path.exists(p):
+            paths.append(p)
+    return tuple(paths)
+
 @st.cache_data(ttl=6*3600, show_spinner=False)
-def load_csvs(files: tuple[str, ...]) -> pd.DataFrame:
+def load_all_data(files: tuple[str, ...]) -> pd.DataFrame:
     dfs = []
     for f in files:
         try:
             df = pd.read_csv(f, encoding="latin1")
-            lg = os.path.basename(f).split("_")[0]
-            df["League"] = lg
-            for col in ["Date","HomeTeam","AwayTeam","FTHG","FTAG","FTR"]:
+            league = os.path.basename(f).split("_")[0]
+            df["League"] = league
+            for col in ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]:
                 if col not in df.columns:
                     df[col] = np.nan
             df["HomeTeam"] = df["HomeTeam"].astype(str).apply(normalize_team_name)
@@ -179,26 +184,6 @@ def load_csvs(files: tuple[str, ...]) -> pd.DataFrame:
         except Exception:
             continue
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-
-# ===== Backfill: ladda nuvarande + föregående säsong =====
-@st.cache_data(ttl=6*3600, show_spinner=True)
-def load_with_backfill(leagues=tuple(LEAGUES), season_now: str = SEASON, season_prev: str = PREV_SEASON):
-    # 1) Nuvarande säsong
-    files_now = download_files(leagues, season_now)
-    df_now = load_csvs(files_now)
-    # 2) Föregående säsong
-    files_prev = download_files(leagues, season_prev)
-    df_prev = load_csvs(files_prev)
-
-    # Markera säsong
-    if not df_now.empty:
-        df_now["Season"] = season_now
-    if not df_prev.empty:
-        df_prev["Season"] = season_prev
-
-    # Slå ihop för features (form/ELO) — datumen avgör ordning, men vi använder bara NU-säsong för laglistan
-    df_all = pd.concat([df_prev, df_now], ignore_index=True) if not df_now.empty or not df_prev.empty else pd.DataFrame()
-    return df_now, df_prev, df_all
 
 # =======================
 # Features: form + ELO
@@ -214,8 +199,8 @@ def calculate_5match_form(df):
     df["HomeFormPts5"], df["HomeFormGD5"], df["AwayFormPts5"], df["AwayFormGD5"] = 0.0, 0.0, 0.0, 0.0
 
     for i, row in df.iterrows():
-        home, away = row.get("HomeTeam",""), row.get("AwayTeam","")
-        fthg, ftag, ftr = row.get("FTHG",0), row.get("FTAG",0), row.get("FTR","D")
+        home, away = row.get("HomeTeam", ""), row.get("AwayTeam", "")
+        fthg, ftag, ftr = row.get("FTHG", 0), row.get("FTAG", 0), row.get("FTR", "D")
 
         if len(home_pts[home]) > 0:
             df.at[i, "HomeFormPts5"] = float(np.mean(home_pts[home]))
@@ -224,37 +209,39 @@ def calculate_5match_form(df):
             df.at[i, "AwayFormPts5"] = float(np.mean(away_pts[away]))
             df.at[i, "AwayFormGD5"]  = float(np.mean(away_gd[away]))
 
-        hp, ap = (3,0) if ftr=="H" else (1,1) if ftr=="D" else (0,3)
+        hp, ap = (3, 0) if ftr == "H" else (1, 1) if ftr == "D" else (0, 3)
         gd_home, gd_away = fthg - ftag, ftag - fthg
         home_pts[home].append(hp); home_gd[home].append(gd_home)
         away_pts[away].append(ap); away_gd[away].append(gd_away)
 
     return df
 
-def compute_elo(df, K=20):
+def compute_elo(df, K=20, initial_elo: dict[str, float] | None = None):
     elo = defaultdict(lambda: 1500.0)
+    if initial_elo:
+        elo.update(initial_elo)
     df = df.copy()
     df["HomeElo"], df["AwayElo"] = 1500.0, 1500.0
 
     for i, row in df.iterrows():
-        home, away = row.get("HomeTeam",""), row.get("AwayTeam","")
-        ftr = row.get("FTR","D")
+        home, away = row.get("HomeTeam", ""), row.get("AwayTeam", "")
+        ftr = row.get("FTR", "D")
         Ra, Rb = elo[home], elo[away]
         Ea = 1/(1+10**((Rb-Ra)/400))
-        Sa = 1 if ftr=="H" else 0.5 if ftr=="D" else 0
+        Sa = 1 if ftr == "H" else 0.5 if ftr == "D" else 0
         Sb = 1 - Sa
         elo[home] = Ra + K*(Sa - Ea)
         elo[away] = Rb + K*(Sb - (1 - Ea))
         df.at[i, "HomeElo"], df.at[i, "AwayElo"] = elo[home], elo[away]
-    return df
+    return df, dict(elo)
 
 @st.cache_data(ttl=6*3600, show_spinner=False)
-def prepare_features(df_all: pd.DataFrame):
-    if df_all.empty:
-        return df_all, []
-    df = df_all.dropna(subset=["FTR"]).copy()
+def prepare_features(df: pd.DataFrame, init_elo: dict[str, float] | None = None):
+    if df.empty:
+        return df, []
+    df = df.dropna(subset=["FTR"])
     df = calculate_5match_form(df)
-    df = compute_elo(df)
+    df, _ = compute_elo(df, initial_elo=init_elo)
     feature_cols = ["HomeFormPts5","HomeFormGD5","AwayFormPts5","AwayFormGD5","HomeElo","AwayElo"]
     return df, feature_cols
 
@@ -298,7 +285,7 @@ def predict_probs(model, features, feature_cols):
     return model.predict_proba(X)[0]
 
 # =======================
-# Laglista (nu-säsong + overrides)
+# Laglista (färsk + manuella tillägg)
 # =======================
 def _league_signature(files: tuple[str, ...]) -> str:
     parts = []
@@ -309,70 +296,200 @@ def _league_signature(files: tuple[str, ...]) -> str:
             parts.append(os.path.basename(p))
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
-def build_team_labels_from_current(df_now: pd.DataFrame, leagues: list[str]) -> dict:
-    out = {lg: set() for lg in leagues}
+def build_team_labels(df_raw: pd.DataFrame, leagues: list[str]) -> list[str]:
+    pairs = set()
     for lg in leagues:
-        sub = df_now[df_now["League"] == lg]
+        sub = df_raw[df_raw["League"] == lg]
         teams = set(sub["HomeTeam"].dropna()) | set(sub["AwayTeam"].dropna())
-        out[lg] |= {normalize_team_name(t) for t in teams}
-    return out
+        for t in teams:
+            t = normalize_team_name(t)
+            if t:
+                pairs.add((t, lg))
+    # Lägg till manuella lag
+    for lg in leagues:
+        for t in MANUAL_TEAMS.get(lg, []):
+            nm = normalize_team_name(t)
+            pairs.add((nm, lg))
+    labels = [f"{t} ({lg})" for (t, lg) in pairs]
+    labels = sorted(labels, key=lambda s: s.lower())
+    return labels
 
-def apply_overrides(team_map: dict) -> list[str]:
-    labels = []
-    for lg, teams in team_map.items():
-        # ta bort explicita exkluderingar
-        teams = {t for t in teams if t not in MANUAL_EXCLUDE.get(lg, set())}
-        # lägg till explicita inklusioner
-        teams |= MANUAL_INCLUDE.get(lg, set())
-        labels.extend([f"{t} ({lg})" for t in sorted(teams, key=str.lower) if t])
-    return sorted(labels, key=str.lower)
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def load_or_create_team_labels(df_raw: pd.DataFrame, leagues: list[str], files_sig: str) -> list[str]:
+    teams_json = os.path.join(DATA_DIR, f"teams_{CURR_SEASON}_{files_sig}.json")
+    try:
+        for f in os.listdir(DATA_DIR):
+            if f.startswith(f"teams_{CURR_SEASON}_") and f.endswith(".json") and f != os.path.basename(teams_json):
+                os.remove(os.path.join(DATA_DIR, f))
+    except Exception:
+        pass
 
-def load_or_create_team_labels(df_now: pd.DataFrame, leagues: list[str], files_sig: str) -> list[str]:
-    teams_json = os.path.join(DATA_DIR, f"teams_{SEASON}_{files_sig}.json")
+    if os.path.exists(teams_json):
+        try:
+            with open(teams_json, "r", encoding="utf-8") as f:
+                labels = json.load(f)
+            if isinstance(labels, list) and labels:
+                return labels
+        except Exception:
+            pass
 
-    # bygg färsk lista från NU-säsongen
-    team_map = build_team_labels_from_current(df_now, leagues)
-    labels = apply_overrides(team_map)
-
-    # spara
+    labels = build_team_labels(df_raw, leagues)
     if labels:
         try:
             with open(teams_json, "w", encoding="utf-8") as f:
                 json.dump(labels, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-
-    # fall tillbaka till ev. befintlig fil om labels blev tom (nätfel)
-    if not labels and os.path.exists(teams_json):
-        try:
-            with open(teams_json, "r", encoding="utf-8") as f:
-                labels = json.load(f)
-        except Exception:
-            labels = []
-
     return labels
 
 # =======================
-# OPENAI (säkert)
+# Backfill & Elo carryover
 # =======================
-def _get_env_or_secret(key: str, default: str = "") -> str:
-    # 1) miljövariabel
-    val = os.getenv(key)
-    if val:
-        return val
-    # 2) streamlit secrets om det finns
-    try:
-        # detta kan kasta om secrets.toml saknas – därav try/except
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def build_elo_carryover(prev_files: tuple[str, ...]) -> dict[str, float]:
+    prev_df = load_all_data(prev_files)
+    if prev_df.empty:
+        return {}
+    prev_df2 = prev_df.dropna(subset=["FTR"]).copy()
+    prev_df2 = calculate_5match_form(prev_df2)
+    _, last_elo_map = compute_elo(prev_df2)
+    return last_elo_map or {}
 
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def load_prev_df(prev_files: tuple[str, ...]) -> pd.DataFrame:
+    return load_all_data(prev_files)
+
+def most_frequent_prev_league(prev_df: pd.DataFrame, team: str) -> str | None:
+    if prev_df.empty:
+        return None
+    sub = prev_df[(prev_df["HomeTeam"]==team) | (prev_df["AwayTeam"]==team)]
+    if sub.empty:
+        return None
+    counts = sub["League"].value_counts()
+    return counts.index[0] if len(counts) else None
+
+def suggested_initial_elo(team: str, last_elo_map: dict[str, float], target_league: str, prev_league_of_team: str | None) -> float:
+    base = 1500.0
+    last = last_elo_map.get(team, base)
+    # regression mot 1500
+    carry = 0.7 * last + 0.3 * base
+    # enkel divisionsjustering
+    adj = 0.0
+    ladder = {"E0":0, "E1":1, "E2":2, "E3":3}
+    if prev_league_of_team and prev_league_of_team in ladder and target_league in ladder:
+        diff = ladder[prev_league_of_team] - ladder[target_league]
+        # ex: E3->E2: diff=+1 (uppflyttning) → +50; E1->E2: diff=-1 (nedflyttning) → -50
+        if diff > 0:
+            adj = 50.0
+        elif diff < 0:
+            adj = -50.0
+    return carry + adj
+
+def extract_latest_current_stats(df_prep: pd.DataFrame, league: str, team: str, role: str) -> list[float] | None:
+    """Hämta features från årets df_prep om de finns."""
+    if role == "home":
+        r = df_prep[(df_prep["League"]==league) & (df_prep["HomeTeam"]==team)].tail(1)
+        if r.empty:
+            return None
+        return [
+            float(r["HomeFormPts5"].values[0]),
+            float(r["HomeFormGD5"].values[0]),
+            float(r["AwayFormPts5"].values[0]),
+            float(r["AwayFormGD5"].values[0]),
+            float(r["HomeElo"].values[0]),
+            float(r["AwayElo"].values[0]),
+        ]
+    else:
+        r = df_prep[(df_prep["League"]==league) & (df_prep["AwayTeam"]==team)].tail(1)
+        if r.empty:
+            return None
+        return [
+            float(r["AwayFormPts5"].values[0]),
+            float(r["AwayFormGD5"].values[0]),
+            float(r["HomeFormPts5"].values[0]),
+            float(r["HomeFormGD5"].values[0]),
+            float(r["AwayElo"].values[0]),
+            float(r["HomeElo"].values[0]),
+        ]
+
+def extract_backfill_stats(prev_df: pd.DataFrame, team: str, role: str, elo_guess: float) -> list[float]:
+    """Bygg features från föregående säsong om årets saknas."""
+    mini = prev_df[(prev_df["HomeTeam"]==team) | (prev_df["AwayTeam"]==team)].copy()
+    if mini.empty:
+        return [0.0,0.0,0.0,0.0, elo_guess, elo_guess]
+    mini = mini.dropna(subset=["FTR"])
+    mini = calculate_5match_form(mini)
+    mini, _ = compute_elo(mini, initial_elo=None)
+    if role == "home":
+        r = mini[mini["HomeTeam"]==team].tail(1)
+        if r.empty:
+            r = mini[(mini["HomeTeam"]==team)|(mini["AwayTeam"]==team)].tail(1)
+        return [
+            float(r["HomeFormPts5"].values[0]) if "HomeFormPts5" in r else 0.0,
+            float(r["HomeFormGD5"].values[0]) if "HomeFormGD5" in r else 0.0,
+            float(r["AwayFormPts5"].values[0]) if "AwayFormPts5" in r else 0.0,
+            float(r["AwayFormGD5"].values[0]) if "AwayFormGD5" in r else 0.0,
+            float(r["HomeElo"].values[0]) if "HomeElo" in r else elo_guess,
+            float(r["AwayElo"].values[0]) if "AwayElo" in r else elo_guess,
+        ]
+    else:
+        r = mini[mini["AwayTeam"]==team].tail(1)
+        if r.empty:
+            r = mini[(mini["HomeTeam"]==team)|(mini["AwayTeam"]==team)].tail(1)
+        return [
+            float(r["AwayFormPts5"].values[0]) if "AwayFormPts5" in r else 0.0,
+            float(r["AwayFormGD5"].values[0]) if "AwayFormGD5" in r else 0.0,
+            float(r["HomeFormPts5"].values[0]) if "HomeFormPts5" in r else 0.0,
+            float(r["HomeFormGD5"].values[0]) if "HomeFormGD5" in r else 0.0,
+            float(r["AwayElo"].values[0]) if "AwayElo" in r else elo_guess,
+            float(r["HomeElo"].values[0]) if "HomeElo" in r else elo_guess,
+        ]
+
+def combined_features_for_match(
+    df_prep_curr: pd.DataFrame,
+    prev_df: pd.DataFrame,
+    elo_last_map: dict[str, float],
+    home_team: str,
+    away_team: str,
+    league: str
+) -> list[float]:
+    # HOME side
+    cur_home = extract_latest_current_stats(df_prep_curr, league, home_team, role="home")
+    if cur_home is None:
+        prev_league_home = most_frequent_prev_league(prev_df, home_team)
+        elo_guess_home = suggested_initial_elo(home_team, elo_last_map, league, prev_league_home)
+        cur_home = extract_backfill_stats(prev_df, home_team, role="home", elo_guess=elo_guess_home)
+
+    # AWAY side
+    cur_away = extract_latest_current_stats(df_prep_curr, league, away_team, role="away")
+    if cur_away is None:
+        prev_league_away = most_frequent_prev_league(prev_df, away_team)
+        elo_guess_away = suggested_initial_elo(away_team, elo_last_map, league, prev_league_away)
+        cur_away = extract_backfill_stats(prev_df, away_team, role="away", elo_guess=elo_guess_away)
+
+    # cur_home = [HFP, HFGD, AFP, AFGD, HElo, AElo] (från HOME-perspektiv)
+    # cur_away = [AFP, AFGD, HFP, HFGD, AElo, HElo] (från AWAY-perspektiv)
+    # Vi bygger features som modellen förväntar sig:
+    # [HomeFormPts5, HomeFormGD5, AwayFormPts5, AwayFormGD5, HomeElo, AwayElo]
+    features = [
+        float(cur_home[0]),
+        float(cur_home[1]),
+        float(cur_away[0]),
+        float(cur_away[1]),
+        float(cur_home[4]),
+        float(cur_away[4]),
+    ]
+    return features
+
+# =======================
+# GPT "Fredagsanalys"
+# =======================
 def get_openai_client():
     if not _HAS_OPENAI:
         return None, "openai-biblioteket saknas (lägg till 'openai' i requirements.txt)."
-    api_key = _get_env_or_secret("OPENAI_API_KEY", "")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return None, "OPENAI_API_KEY saknas (lägg in som Render env var)."
+        return None, "OPENAI_API_KEY saknas (lägg in i Render → Environment)."
     try:
         client = OpenAI(api_key=api_key)
         return client, None
@@ -412,48 +529,55 @@ Svara med 3 korta punkter:
 # =======================
 with st.sidebar:
     st.header("Status")
-    st.write("Säsongskod (nu):", SEASON)
-    st.write("Säsongskod (föreg.):", PREV_SEASON)
-    st.write("Hämtar data…")
+    st.write("Säsongskod:", CURR_SEASON)
 
-# Ladda data (nu + backfill)
-df_now, df_prev, df_all = load_with_backfill(tuple(LEAGUES), SEASON, PREV_SEASON)
+with st.status("Hämtar data för aktuell säsong …", expanded=False):
+    files = download_files(tuple(MAIN_LEAGUES), CURR_SEASON)
+    st.write(f"Filer klara: {len(files)}")
 
-# Status: antal matcher per liga (nu-säsong) + total (featuresbas)
-with st.sidebar:
-    now_counts = {lg: int(((df_now["League"]==lg).sum()) if not df_now.empty else 0) for lg in LEAGUES}
-    all_counts = {lg: int(((df_all["League"]==lg).sum()) if not df_all.empty else 0) for lg in LEAGUES}
-    st.write("Nu-säsong matcher:", sum(now_counts.values()))
-    for lg in LEAGUES:
-        st.write(f"{lg}: nu={now_counts[lg]} | alla={all_counts[lg]}")
-    st.write("OPENAI:", "OK" if _get_env_or_secret("OPENAI_API_KEY","") else "—")
-
-# Stoppa om inget alls
-if df_all.empty:
-    st.error("Ingen data nedladdad (varken nuvarande eller föregående säsong). Testa senare.")
+df_raw = load_all_data(files)
+if df_raw.empty:
+    st.error("Ingen data nedladdad. Kontrollera att football-data.co.uk är uppe eller testa senare.")
     st.stop()
 
-# Features på sammanslagen data (nu + föregående)
-df_prep, feat_cols = prepare_features(df_all)
+with st.status("Förbereder backfill (föregående säsong) …", expanded=False):
+    prev_files = download_prev_season(tuple(BACKFILL_LEAGUES), PREV_SEASON)
+    prev_df = load_prev_df(prev_files)
+    elo_last_map = build_elo_carryover(prev_files)
+    st.write(f"Backfill: {len(prev_df)} rader")
+
+# Räknare i sidebar
+with st.sidebar:
+    c_e0 = (df_raw["League"]=="E0").sum()
+    c_e1 = (df_raw["League"]=="E1").sum()
+    c_e2 = (df_raw["League"]=="E2").sum()
+    u_e0 = len(set(df_raw.loc[df_raw["League"]=="E0","HomeTeam"]) | set(df_raw.loc[df_raw["League"]=="E0","AwayTeam"]))
+    u_e1 = len(set(df_raw.loc[df_raw["League"]=="E1","HomeTeam"]) | set(df_raw.loc[df_raw["League"]=="E1","AwayTeam"]))
+    u_e2 = len(set(df_raw.loc[df_raw["League"]=="E2","HomeTeam"]) | set(df_raw.loc[df_raw["League"]=="E2","AwayTeam"]))
+    st.write(f"Rader: E0={c_e0}, E1={c_e1}, E2={c_e2}, Totalt={len(df_raw)}")
+    st.write(f"Unika lag: E0={u_e0}, E1={u_e1}, E2={u_e2}")
+    st.write("OPENAI:", "OK" if os.getenv("OPENAI_API_KEY") else "—")
+
+# Features (aktuella matcher spelade hittills; carryover täcks senare per lag)
+df_prep, feat_cols = prepare_features(df_raw, init_elo=None)
 if not feat_cols:
     st.error("Kunde inte förbereda features (saknas FTR eller bas-kolumner).")
     st.stop()
 
-# Modell (cache)
 latest_ts = int(pd.to_datetime(df_prep["Date"], errors="coerce").max().timestamp()) if "Date" in df_prep.columns else 0
 df_signature = (len(df_prep), latest_ts)
 model = load_or_train_model(df_signature, df_prep, feat_cols)
 
-# Laglista: bygg från NU-säsongen + overrides
-# (även om nu-säsongen är tom för en liga, MANUAL_INCLUDE kan fortfarande lägga till lag)
-files_sig = "now_" + hashlib.sha256((";".join(sorted([str(c) for c in now_counts.items()]))).encode("utf-8")).hexdigest()[:12]
-teams_all = load_or_create_team_labels(df_now, LEAGUES, files_sig)
-
+# Laglista
+files_sig = _league_signature(files)
+teams_all = load_or_create_team_labels(df_raw, MAIN_LEAGUES, files_sig)
 if not teams_all:
-    st.warning("Kunde inte skapa laglistan. Kontrollera nät/uppdatering.")
+    st.warning("Kunde inte skapa laglistan. Kontrollera att minst en match finns i varje liga.")
     st.stop()
 
-# ===== UI =====
+# =======================
+# UI – Inputs
+# =======================
 n_matches = st.number_input("Antal matcher att tippa", 1, 13, value=13)
 n_half = st.number_input("Antal halvgarderingar", 0, n_matches, value=0)  # default 0
 
@@ -465,8 +589,11 @@ for i in range(n_matches):
     if home and away and home != away:
         match_pairs.append((home, away))
 
-def pick_half_guards(match_probs, n_half):
-    if n_half <= 0:
+# =======================
+# Halvgardering
+# =======================
+def pick_half_guards(match_probs, n_half_):
+    if n_half_ <= 0:
         return set()
     margins = []
     for i, p in enumerate(match_probs):
@@ -477,7 +604,7 @@ def pick_half_guards(match_probs, n_half):
         margin = s[-1] - s[-2]
         margins.append((i, margin))
     margins.sort(key=lambda x: x[1])
-    return {i for i,_ in margins[:n_half]}
+    return {i for i,_ in margins[:n_half_]}
 
 def halfguard_sign(probs):
     idxs = np.argsort(probs)[-2:]
@@ -485,41 +612,36 @@ def halfguard_sign(probs):
     mapping = {(0,1): "1X", (0,2): "12", (1,2): "X2"}
     return mapping.get(idxs, "1X")
 
+# =======================
+# Kör tips
+# =======================
 if st.button("Tippa matcher", use_container_width=True):
     rows, match_probs, tecken_list, match_meta = [], [], [], []
 
-    # OBS: Vi hämtar features från df_prep (alla säsonger), men
-    # vi väljer "senaste" rader via datum för respektive lag & liga.
-    for (home, away) in match_pairs:
-        home_team, home_lg = home.rsplit(" (",1)
-        away_team, away_lg = away.rsplit(" (",1)
+    for (home_label, away_label) in match_pairs:
+        home_team, home_lg = home_label.rsplit(" (",1)
+        away_team, away_lg = away_label.rsplit(" (",1)
         home_team, home_lg = home_team.strip(), home_lg.strip(")")
         away_team, away_lg = away_team.strip(), away_lg.strip(")")
 
+        # Normalisera
         home_team = normalize_team_name(home_team)
         away_team = normalize_team_name(away_team)
 
-        # Senaste observation för varje sida i den ligan (kan vara från nu- eller föregående säsong)
-        h_row = df_prep[(df_prep["League"]==home_lg) & (df_prep["HomeTeam"]==home_team)].sort_values("Date").tail(1)
-        a_row = df_prep[(df_prep["League"]==away_lg) & (df_prep["AwayTeam"]==away_team)].sort_values("Date").tail(1)
-
-        if h_row.empty or a_row.empty:
-            match_probs.append(np.array([0.0,0.0,0.0]))
-            match_meta.append((home_team, away_team, f"{home_lg}", 0,0,0,0,0,0))
-            continue
-
-        features = [
-            float(h_row["HomeFormPts5"].values[0]),
-            float(h_row["HomeFormGD5"].values[0]),
-            float(a_row["AwayFormPts5"].values[0]),
-            float(a_row["AwayFormGD5"].values[0]),
-            float(h_row["HomeElo"].values[0]),
-            float(a_row["AwayElo"].values[0])
-        ]
+        # Bygg features m/backfill vid behov
+        features = combined_features_for_match(
+            df_prep_curr=df_prep,
+            prev_df=prev_df,
+            elo_last_map=elo_last_map,
+            home_team=home_team,
+            away_team=away_team,
+            league=home_lg  # samma liga i UI
+        )
         probs = predict_probs(model, features, feat_cols)
         match_probs.append(probs)
         match_meta.append((home_team, away_team, home_lg, *features))
 
+    # välj halvgarderingar
     half_idxs = pick_half_guards(match_probs, n_half)
 
     for idx, ((home_label, away_label), probs, meta) in enumerate(zip(match_pairs, match_probs, match_meta), start=1):
@@ -549,11 +671,11 @@ if st.button("Tippa matcher", use_container_width=True):
         if err:
             st.warning(err)
         else:
-            st.caption("Analysen bygger endast på form/ELO/sannolikheter (inga nyheter för att undvika påhitt).")
-            for i, (home_team, away_team, lg, hfp, hfgd, afp, afgd, helo, aelo) in enumerate(match_meta, start=1):
-                if match_probs[i-1] is None or np.sum(match_probs[i-1]) == 0:
-                    st.markdown(f"**{i}) {home_team} ({lg}) - {away_team}**\n*(Ingen data till analys)*")
-                    continue
+            st.caption("Analysen bygger endast på form/ELO/sannolikheter (inga nyheter).")
+            for i, (home_team, away_team, lg, hfp, hfgd, afp, afgd, helo, aelo) in enumerate(
+                [(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]) for m in match_meta],
+                start=1
+            ):
                 p1, px, p2 = match_probs[i-1]
                 summary = gpt_match_brief(
                     client, home_team, away_team, lg,
