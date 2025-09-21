@@ -14,7 +14,9 @@ import os
 import re
 import json
 import time
+import glob
 import hashlib
+from pathlib import Path
 from datetime import datetime
 from collections import defaultdict, deque
 from typing import Optional, Tuple, List
@@ -33,7 +35,6 @@ try:
     _HAS_OPENAI = True
 except Exception:
     _HAS_OPENAI = False
-
 
 # =======================
 #   Grundinställningar
@@ -57,7 +58,6 @@ def _season_code() -> str:
     return f"{prev:02d}{y:02d}"
 
 SEASON = _season_code()
-
 
 # =======================
 #   Hjälpfunktioner
@@ -89,6 +89,11 @@ TEAM_ALIASES = {
     "Sheff Utd": "Sheffield United",
     "QPR": "Queens Park Rangers",
     "MK Dons": "Milton Keynes Dons",
+    "Wolves": "Wolverhampton Wanderers",
+    "Wolverhampton": "Wolverhampton Wanderers",
+    "Nottingham": "Nottingham Forest",
+    "Nottingham F": "Nottingham Forest",
+    "Nottingham Forest": "Nottingham Forest",
 }
 
 def normalize_team_name(raw: str) -> str:
@@ -104,16 +109,15 @@ def _safe_secret(key: str) -> Optional[str]:
     """
     SÄKER hemlighetshämtning.
     - Försök env först (Render/Heroku m.fl.)
-    - Försök st.secrets endast om det finns och är laddat
+    - Försök st.secrets endast om det finns och är laddat, och använd `in` för att undvika parse-fel
     - Returnerar None om inget hittas
     """
     val = os.getenv(key)
     if val:
         return val
     try:
-        # st.secrets är en Mapping; att kalla get när fil saknas kastar annars.
         if hasattr(st, "secrets"):
-            # IMPORTANT: använd 'in' istället för get() för att undvika parse när fil saknas
+            # Viktigt: använd 'in' i stället för get()
             if key in st.secrets:
                 return st.secrets[key]
     except Exception:
@@ -122,7 +126,6 @@ def _safe_secret(key: str) -> Optional[str]:
 
 def _has_openai_key() -> bool:
     return bool(_HAS_OPENAI and _safe_secret("OPENAI_API_KEY"))
-
 
 # =======================
 #   HTTP med retries
@@ -139,7 +142,6 @@ def _http_get(url: str, timeout: float = 10.0) -> Optional[bytes]:
         return r.content
     except Exception:
         return None
-
 
 # =======================
 #   Nedladdning & laddning
@@ -194,7 +196,6 @@ def load_all_data(files: Tuple[str, ...]) -> pd.DataFrame:
         except Exception:
             continue
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-
 
 # =======================
 #   Features: form + ELO
@@ -260,7 +261,6 @@ def prepare_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     feature_cols = ["HomeFormPts5", "HomeFormGD5", "AwayFormPts5", "AwayFormGD5", "HomeElo", "AwayElo"]
     return df, feature_cols
 
-
 # =======================
 #   Modell (XGBoost)
 # =======================
@@ -300,7 +300,6 @@ def load_or_train_model(df_signature: Tuple[int, int] | None,
 def predict_probs(model: XGBClassifier, features: List[float], feature_cols: List[str]) -> np.ndarray:
     X = pd.DataFrame([features], columns=feature_cols)
     return model.predict_proba(X)[0]
-
 
 # =======================
 #   Laglista (alltid färsk)
@@ -355,7 +354,6 @@ def load_or_create_team_labels(df_raw: pd.DataFrame, leagues: List[str], files_s
             pass
     return labels
 
-
 # =======================
 #   OpenAI (fredagsanalys)
 # =======================
@@ -403,14 +401,13 @@ Svara med 3 korta punkter:
         return f"(Ingen GPT-analys: {e})"
 
 def gpt_predict_for_unknown(client, home: str, away: str) -> str:
-    """
-    Minimal fallback-analys när vi saknar data (match utanför E0–E2 eller ny säsong utan historik).
-    Returnerar en kort, försiktig text – inga påhittade skador/nyheter.
-    """
+    """Minimal fallback-analys när vi saknar data för matchen."""
     try:
-        prompt = (f"Du är en saklig oddsanalytiker. Vi saknar data för {home} - {away}. "
-                  "Ge en kort mycket försiktig bedömning med 2–3 meningar, baserat på allmän kännedom "
-                  "(hemmaplan lite fördel, oavgjort vanligt, osv). Inga djärva påståenden.")
+        prompt = (
+            f"Vi saknar E0–E2-data för {home} - {away}. "
+            "Ge en kort försiktig bedömning i 2–3 meningar (hemmaplan liten fördel, oavgjort vanligt, osv). "
+            "Inga djärva påståenden, inga skador eller nyheter."
+        )
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -421,17 +418,13 @@ def gpt_predict_for_unknown(client, home: str, away: str) -> str:
     except Exception as e:
         return f"(Ingen GPT-fallback: {e})"
 
-
 # =======================
 #   Manuell tipsrad: tolkare
 # =======================
 LEAGUE_TAG_RE = re.compile(r"\((E0|E1|E2)\)", flags=re.IGNORECASE)
 
 def _extract_league_tag(text: str) -> Tuple[str, Optional[str]]:
-    """
-    Plocka ut valfri ligatagg (E0/E1/E2) var som helst i texten.
-    Returnerar (rensad_text, 'E0'|'E1'|'E2'|None)
-    """
+    """Plocka ut valfri ligatagg (E0/E1/E2) var som helst i texten."""
     m = LEAGUE_TAG_RE.search(text)
     league = None
     if m:
@@ -452,9 +445,7 @@ def parse_manual_lines(s: str, expected_n: int) -> List[Tuple[str, str, Optional
         line = raw.strip()
         if not line:
             continue
-        # plocka ligataggar
         line, tag = _extract_league_tag(line)
-        # splitta på '-' (första förekomsten)
         if "-" not in line:
             continue
         h, a = line.split("-", 1)
@@ -464,7 +455,6 @@ def parse_manual_lines(s: str, expected_n: int) -> List[Tuple[str, str, Optional
         if len(out) >= expected_n:
             break
     return out
-
 
 # =======================
 #   UI – sidomeny
@@ -493,7 +483,9 @@ if not feat_cols:
     st.error("Kunde inte förbereda features (saknas FTR eller bas-kolumner).")
     st.stop()
 
-latest_ts = int(pd.to_datetime(df_prep["Date"], errors="coerce").max().timestamp()) if "Date" in df_prep.columns else 0
+# Robust latest_ts (NaT-säker)
+latest_dt = pd.to_datetime(df_prep["Date"], errors="coerce").max() if "Date" in df_prep.columns else None
+latest_ts = int(latest_dt.timestamp()) if (latest_dt is not None and pd.notna(latest_dt)) else 0
 df_signature = (len(df_prep), latest_ts)
 model = load_or_train_model(df_signature, df_prep, feat_cols)
 
@@ -503,16 +495,13 @@ if not teams_all:
     st.warning("Kunde inte skapa laglistan. Kontrollera att minst en match finns i varje liga.")
     st.stop()
 
-# Extra sidomeny-info (rålaglista E2)
+# Extra sidomeny-info (rålaglista E2 + filer)
 with st.sidebar:
     with st.expander("E2-lag (rådata, normaliserat)", expanded=False):
         e2_home = set(df_raw.loc[df_raw["League"] == "E2", "HomeTeam"].dropna().astype(str))
         e2_away = set(df_raw.loc[df_raw["League"] == "E2", "AwayTeam"].dropna().astype(str))
         e2_teams = sorted({normalize_team_name(x) for x in (e2_home | e2_away)})
         st.write(", ".join(e2_teams))
-
-    # Debug: Lista alla CSV-filer i data/
-    import glob
     st.subheader("Filer i data/")
     try:
         csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
@@ -524,6 +513,51 @@ with st.sidebar:
     except Exception as e:
         st.write("Fel vid listning av data/-mappen:", e)
 
+st.divider()
+st.caption("Underhåll")
+reset_model = st.checkbox(
+    "Nollställ modell-cache också",
+    value=False,
+    help="Kryssa i om du vill tvinga omträning och rensa models/-filen."
+)
+
+if st.button("↻ Ladda om CSV-filer", use_container_width=True,
+             help="Rensar data/-CSV-filer, tömmer cache och hämtar om E0–E2."):
+    try:
+        # 1) Ta bort gamla CSV:er
+        removed = 0
+        Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+        for f in glob.glob(os.path.join(DATA_DIR, "*.csv")):
+            try:
+                os.remove(f)
+                removed += 1
+            except Exception:
+                pass
+
+        # 2) Rensa Streamlit-cachar
+        st.cache_data.clear()
+        if reset_model:
+            st.cache_resource.clear()
+            try:
+                if os.path.exists(MODEL_FILE):
+                    os.remove(MODEL_FILE)
+            except Exception:
+                pass
+
+        # 3) Hämta om
+        new_paths = download_files(tuple(LEAGUES), SEASON)
+
+        # 4) Återrapport
+        st.success(f"Klart! Tog bort {removed} filer och laddade ner {len(new_paths)} nya.")
+        if new_paths:
+            st.write("Nedladdade:")
+            for p in new_paths:
+                st.write("•", os.path.basename(p))
+
+        st.rerun()
+    except Exception as e:
+        st.error(f"Något gick fel vid omladdning: {e}")
+
 # =======================
 #   Huvud – inputs
 # =======================
@@ -531,9 +565,9 @@ n_matches = st.number_input("Antal matcher att tippa", min_value=1, max_value=13
 n_half = st.number_input("Antal halvgarderingar", min_value=0, max_value=int(n_matches), value=0, step=1)
 
 st.markdown("### Förifyll tipsrad (manuellt)")
-st.caption('Klistra in **13 rader** (valfri liga tillåten). Format-exempel:\
-  \n`Arsenal - Everton` eller `Arsenal (E0) - Everton (E0)` eller `AIK - Hammarby`.\
-  \nOm en match saknar data i E0–E2 används GPT-fallback (om nyckel finns).')
+st.caption('Klistra in **13 rader** (valfri liga tillåten). Format-exempel:'
+           '\n`Arsenal - Everton` eller `Arsenal (E0) - Everton (E0)` eller `AIK - Hammarby`.'
+           '\nOm en match saknar data i E0–E2 används GPT-fallback (om nyckel finns).')
 
 default_13 = (
     "Fulham - Brentford\n"
@@ -554,10 +588,9 @@ default_13 = (
 manual_text = st.text_area("Klistra in 13 rader (valfri liga tillåten).", value=default_13, height=180)
 manual_pairs = parse_manual_lines(manual_text, expected_n=int(n_matches))
 if len(manual_pairs) == int(n_matches):
-    st.success(f"Upptäckte {len(manual_pairs)} manuella rader. Dessa används nedan.")
+    st.success(f"Upptäckte {len(manual_pairs)} manuella rader. Dessa används.")
 else:
-    st.info(f"Upptäckte {len(manual_pairs)} manuella rader (av {n_matches}). Tomma rader ignoreras.")
-
+    st.info(f"Upptäckte {len(manual_pairs)} manuella rader (av {n_matches}). Tomma/felaktiga rader ignoreras.")
 
 # =======================
 #   Match → features
@@ -574,11 +607,9 @@ def _latest_rows_for_match(df_feat: pd.DataFrame,
     if league_hint:
         df = df[df["League"] == league_hint]
 
-    # Senaste hemmarad och bortarad för respektive lag
     h_row = df[(df["HomeTeam"] == home)].sort_values("Date").tail(1)
     a_row = df[(df["AwayTeam"] == away)].sort_values("Date").tail(1)
 
-    # Om tomma och det fanns hint → försök utan hint (kanske har blandats)
     if (h_row.empty or a_row.empty) and league_hint:
         df2 = df_feat
         h2 = df2[(df2["HomeTeam"] == home)].sort_values("Date").tail(1)
@@ -589,7 +620,6 @@ def _latest_rows_for_match(df_feat: pd.DataFrame,
         used = league_hint if league_hint else (h_row.iloc[0]["League"] if pd.notna(h_row.iloc[0]["League"]) else None)
         return h_row.iloc[0], a_row.iloc[0], used
     return None, None, league_hint
-
 
 def _pick_half_guards(match_probs: List[Optional[np.ndarray]], n_half: int) -> set:
     if n_half <= 0:
@@ -611,7 +641,6 @@ def _halfguard_sign(probs: np.ndarray) -> str:
     mapping = {(0, 1): "1X", (0, 2): "12", (1, 2): "X2"}
     return mapping.get(idxs, "1X")
 
-
 # =======================
 #   Körning
 # =======================
@@ -621,20 +650,15 @@ if st.button("Tippa matcher", use_container_width=True):
     tecken_list: List[str] = []
     match_meta = []  # (home, away, league_used, hfp, hfgd, afp, afgd, helo, aelo)
 
-    # Använd manuella par om de finns i antal == n_matches,
-    # annars fyller vi listan med E0–E2-väljare (fallback).
     if len(manual_pairs) == int(n_matches):
         pairs_to_use = manual_pairs
     else:
-        # Fallback – tom lista (användaren får klicka igen efter manualen fixats)
-        pairs_to_use = []
+        pairs_to_use = []  # användaren får korrigera texten
 
-    # Processa
     for (home, away, lg_hint) in pairs_to_use:
         h_row, a_row, used_lg = _latest_rows_for_match(df_prep, home, away, lg_hint)
 
         if (h_row is None) or (a_row is None):
-            # Ingen data → ingen modellprognos. Sätt tom probs och metadata 0.
             match_probs.append(None)
             match_meta.append((home, away, used_lg or "—", 0, 0, 0, 0, 0, 0))
             continue
@@ -657,21 +681,20 @@ if st.button("Tippa matcher", use_container_width=True):
     # Halvgarderingar
     half_idxs = _pick_half_guards(match_probs, int(n_half))
 
-    # Tabell
-    for idx, ((home, away, _lg), probs, meta) in enumerate(zip(
-            [p[:2] + (p[2] if len(p) > 2 else None,) for p in pairs_to_use],  # bara för iteration
-            match_probs,
-            match_meta
-        ), start=1):
-        home_label, away_label, _ = pairs_to_use[idx-1]
+    # Tabell (förenklad, robust)
+    for idx in range(1, len(pairs_to_use) + 1):
+        home_label, away_label, _ = pairs_to_use[idx - 1]
+        probs = match_probs[idx - 1]
+
         if (probs is None) or (len(probs) != 3) or float(np.sum(probs)) == 0.0:
-            tecken, pct = "(X)", ""  # okänd → neutral markering
+            tecken, pct = "(X)", ""
         else:
-            if (idx-1) in half_idxs:
+            if (idx - 1) in half_idxs:
                 tecken, pct = f"({_halfguard_sign(probs)})", "-"
             else:
                 pred = int(np.argmax(probs))
                 tecken, pct = f"({['1','X','2'][pred]})", f"{probs[pred]*100:.1f}%"
+
         rows.append([idx, "", f"{home_label} - {away_label}", tecken, "", "", pct])
         tecken_list.append(tecken)
 
@@ -702,7 +725,10 @@ if st.button("Tippa matcher", use_container_width=True):
                     st.markdown(f"**{i}) {home_team} ({lg}) - {away_team}**")
                     st.write(summary)
                 else:
-                    # Ingen data i E0–E2 → mycket försiktig GPT-fallback om nyckel finns
-                    fallback = gpt_predict_for_unknown(client, home_team, away_team)
+                    # Ingen E0–E2-data → försiktig GPT-fallback om nyckel finns
+                    if _has_openai_key():
+                        fallback = gpt_predict_for_unknown(client, home_team, away_team)
+                    else:
+                        fallback = "(Saknar data och ingen OPENAI_API_KEY – ingen analys.)"
                     st.markdown(f"**{i}) {home_team} - {away_team}** *(ingen E0–E2-data)*")
                     st.write(fallback)
