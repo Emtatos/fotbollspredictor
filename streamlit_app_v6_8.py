@@ -1,4 +1,3 @@
-%%writefile streamlit_app_v6_8.py
 # streamlit_app_v6_8.py
 # v6.8 — Stabil laglista + normalisering + auto-refresh
 # - Laddar E0–E2 (Premier, Championship, League One)
