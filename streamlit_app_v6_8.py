@@ -511,6 +511,18 @@ with st.sidebar:
         e2_teams = sorted({normalize_team_name(x) for x in (e2_home | e2_away)})
         st.write(", ".join(e2_teams))
 
+    # Debug: Lista alla CSV-filer i data/
+    import glob
+    st.subheader("Filer i data/")
+    try:
+        csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+        if csv_files:
+            for f in csv_files:
+                st.write(os.path.basename(f), f"({os.path.getsize(f)} bytes)")
+        else:
+            st.write("❌ Inga CSV-filer hittades i data/-mappen.")
+    except Exception as e:
+        st.write("Fel vid listning av data/-mappen:", e)
 
 # =======================
 #   Huvud – inputs
