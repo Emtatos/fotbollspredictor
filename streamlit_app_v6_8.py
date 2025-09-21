@@ -5,6 +5,7 @@
 # - Rensar och bygger om laglistan när CSV ändras (ingen fastnar i gammal JSON)
 # - Timeout/retries vid nedladdning (app hänger inte)
 # - "Fredagsanalys" via OpenAI (frivilligt)
+# - Låsning av lag → rätt liga för aktuell säsong (t.ex. upp-/nedflyttningar)
 
 import os
 import json
@@ -22,16 +23,15 @@ import requests
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
-# -------- OpenAI (GPT) ----------
+# ========= OpenAI (GPT) (frivilligt) =========
 try:
     from openai import OpenAI
     _HAS_OPENAI = True
 except Exception:
     _HAS_OPENAI = False
 
-# =======================
-# Grundinställningar
-# =======================
+
+# ========= Grundinställningar =========
 st.set_page_config(page_title="Fotboll v6.8 — E0–E2 + Fredagsanalys", layout="wide")
 st.title("⚽ Fotboll v6.8 — Tippa matcher (E0–E2) + halvgarderingar + Fredagsanalys")
 
@@ -44,16 +44,17 @@ MODEL_FILE = os.path.join(MODEL_DIR, "model_v6.pkl")
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
 LEAGUES = ["E0", "E1", "E2"]  # Premier, Championship, League One
 
-def season_code():
+
+def season_code() -> str:
     y = datetime.now().year % 100
     prev = y - 1
     return f"{prev:02d}{y:02d}"
 
+
 SEASON = season_code()
 
-# =======================
-# Hjälpare
-# =======================
+
+# ========= Hjälpare =========
 def _hash_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -61,8 +62,10 @@ def _hash_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()[:16]
 
+
 def _norm_space(s: str) -> str:
     return " ".join(str(s).strip().split())
+
 
 # Namn-normalisering för Football-Data varianter → standardnamn
 TEAM_ALIASES = {
@@ -83,6 +86,7 @@ TEAM_ALIASES = {
     "MK Dons": "Milton Keynes Dons",
 }
 
+
 def normalize_team_name(raw: str) -> str:
     s = _norm_space(raw)
     if s in TEAM_ALIASES:
@@ -92,13 +96,13 @@ def normalize_team_name(raw: str) -> str:
     s = s.replace(" C.", " C")
     return TEAM_ALIASES.get(s, s)
 
-# =======================
-# HTTP med timeout/retries
-# =======================
+
+# ========= HTTP med timeout/retries =========
 SESSION = requests.Session()
 ADAPTER = requests.adapters.HTTPAdapter(max_retries=3)
 SESSION.mount("https://", ADAPTER)
 SESSION.mount("http://", ADAPTER)
+
 
 def _http_get(url: str, timeout: float = 10.0) -> bytes | None:
     try:
@@ -108,7 +112,8 @@ def _http_get(url: str, timeout: float = 10.0) -> bytes | None:
     except Exception:
         return None
 
-@st.cache_data(ttl=6*3600, show_spinner=True)
+
+@st.cache_data(ttl=6 * 3600, show_spinner=True)
 def _download_one(league: str, s_code: str) -> str | None:
     target = os.path.join(DATA_DIR, f"{league}_{s_code}.csv")
     url = f"{BASE_URL}/{s_code}/{league}.csv"
@@ -128,7 +133,8 @@ def _download_one(league: str, s_code: str) -> str | None:
     except Exception:
         return None
 
-@st.cache_data(ttl=6*3600, show_spinner=True)
+
+@st.cache_data(ttl=6 * 3600, show_spinner=True)
 def download_files(leagues=tuple(LEAGUES), s_code: str = SEASON):
     paths = []
     for L in leagues:
@@ -141,7 +147,8 @@ def download_files(leagues=tuple(LEAGUES), s_code: str = SEASON):
         st.error("Ingen liga kunde hämtas. Testa senare eller byt nät.")
     return tuple(paths)
 
-@st.cache_data(ttl=6*3600, show_spinner=False)
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_all_data(files: tuple[str, ...]) -> pd.DataFrame:
     dfs = []
     for f in files:
@@ -159,9 +166,8 @@ def load_all_data(files: tuple[str, ...]) -> pd.DataFrame:
             continue
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-# =======================
-# Features: form + ELO
-# =======================
+
+# ========= Features: form + ELO =========
 def calculate_5match_form(df):
     df = df.copy()
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
@@ -178,17 +184,20 @@ def calculate_5match_form(df):
 
         if len(home_pts[home]) > 0:
             df.at[i, "HomeFormPts5"] = float(np.mean(home_pts[home]))
-            df.at[i, "HomeFormGD5"]  = float(np.mean(home_gd[home]))
+            df.at[i, "HomeFormGD5"] = float(np.mean(home_gd[home]))
         if len(away_pts[away]) > 0:
             df.at[i, "AwayFormPts5"] = float(np.mean(away_pts[away]))
-            df.at[i, "AwayFormGD5"]  = float(np.mean(away_gd[away]))
+            df.at[i, "AwayFormGD5"] = float(np.mean(away_gd[away]))
 
         hp, ap = (3, 0) if ftr == "H" else (1, 1) if ftr == "D" else (0, 3)
         gd_home, gd_away = fthg - ftag, ftag - fthg
-        home_pts[home].append(hp); home_gd[home].append(gd_home)
-        away_pts[away].append(ap); away_gd[away].append(gd_away)
+        home_pts[home].append(hp)
+        home_gd[home].append(gd_home)
+        away_pts[away].append(ap)
+        away_gd[away].append(gd_away)
 
     return df
+
 
 def compute_elo(df, K=20):
     elo = defaultdict(lambda: 1500.0)
@@ -207,7 +216,8 @@ def compute_elo(df, K=20):
         df.at[i, "HomeElo"], df.at[i, "AwayElo"] = elo[home], elo[away]
     return df
 
-@st.cache_data(ttl=6*3600, show_spinner=False)
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def prepare_features(df: pd.DataFrame):
     if df.empty:
         return df, []
@@ -217,9 +227,8 @@ def prepare_features(df: pd.DataFrame):
     feature_cols = ["HomeFormPts5", "HomeFormGD5", "AwayFormPts5", "AwayFormGD5", "HomeElo", "AwayElo"]
     return df, feature_cols
 
-# =======================
-# Modell
-# =======================
+
+# ========= Modell =========
 def _quick_train(df, feature_cols):
     X = df[feature_cols].fillna(0.0)
     y = df["FTR"].map({"H": 0, "D": 1, "A": 2}).astype(int)
@@ -230,15 +239,16 @@ def _quick_train(df, feature_cols):
         params = dict(n_estimators=200, max_depth=5, learning_rate=0.1, subsample=0.9, reg_lambda=1.0)
 
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y,
-        test_size=min(0.2, max(0.1, 200/len(X))) if len(X) > 200 else 0.2,
-        random_state=42, stratify=y
+        X,
+        y,
+        test_size=min(0.2, max(0.1, 200 / len(X))) if len(X) > 200 else 0.2,
+        random_state=42,
+        stratify=y,
     )
-    model = XGBClassifier(
-        **params, objective="multi:softprob", num_class=3, n_jobs=1
-    )
+    model = XGBClassifier(**params, objective="multi:softprob", num_class=3, n_jobs=1)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     return model
+
 
 @st.cache_resource(show_spinner=True)
 def load_or_train_model(df_signature: tuple[int, int] | None, df: pd.DataFrame, feature_cols: list[str]):
@@ -254,13 +264,13 @@ def load_or_train_model(df_signature: tuple[int, int] | None, df: pd.DataFrame, 
         pass
     return model
 
+
 def predict_probs(model, features, feature_cols):
     X = pd.DataFrame([features], columns=feature_cols)
     return model.predict_proba(X)[0]
 
-# =======================
-# Laglista (ALLTID färsk + korrekta namn)
-# =======================
+
+# ========= Laglista (alltid färsk + korrekta namn) =========
 def _league_signature(files: tuple[str, ...]) -> str:
     parts = []
     for p in files:
@@ -269,6 +279,7 @@ def _league_signature(files: tuple[str, ...]) -> str:
         except Exception:
             parts.append(os.path.basename(p))
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
 
 def build_team_labels(df_raw: pd.DataFrame, leagues: list[str]) -> list[str]:
     pairs = set()
@@ -282,6 +293,7 @@ def build_team_labels(df_raw: pd.DataFrame, leagues: list[str]) -> list[str]:
     labels = [f"{t} ({lg})" for (t, lg) in pairs]
     labels = sorted(labels, key=lambda s: s.lower())
     return labels
+
 
 def load_or_create_team_labels(df_raw: pd.DataFrame, leagues: list[str], files_sig: str) -> list[str]:
     teams_json = os.path.join(DATA_DIR, f"teams_{SEASON}_{files_sig}.json")
@@ -310,20 +322,61 @@ def load_or_create_team_labels(df_raw: pd.DataFrame, leagues: list[str], files_s
             pass
     return labels
 
-# =======================
-# GPT "Fredagsanalys"
-# =======================
+
+# ========= Låsningar (upp-/nedflyttningar) =========
+# Fyll i per säsong (lägg endast lag som bytt nivå).
+TEAM_LEAGUE_OVERRIDE: dict[str, dict[str, str]] = {
+    SEASON: {
+        # Exempel: Bradford upp i E2 denna säsong
+        "Bradford City": "E2",
+        # Fyll på här när allt är officiellt:
+        # "Leeds United": "E0",
+        # "Rotherham United": "E1",
+        # ...
+    }
+}
+
+
+def apply_overrides_to_labels(labels: list[str], override_map: dict[str, str]) -> list[str]:
+    """
+    Tar en lista 'Lag (E2)' och ersätter lagens liga utifrån override_map.
+    Om ett lag finns med annan liga tas den bort och ersätts.
+    """
+    if not override_map:
+        return labels
+    out = set(labels)
+    for team, target_lg in override_map.items():
+        to_remove = {s for s in out if s.startswith(f"{team} (")}
+        out.difference_update(to_remove)
+        out.add(f"{team} ({target_lg})")
+    return sorted(out, key=lambda s: s.lower())
+
+
+# ========= GPT "Fredagsanalys" =========
+def _get_openai_key() -> str | None:
+    # 1) Miljövariabel (Render: Environment → Environment Variables)
+    env_key = os.getenv("OPENAI_API_KEY")
+    if env_key:
+        return env_key
+    # 2) Försök läs st.secrets om det finns, utan att krascha om secrets saknas
+    try:
+        return st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        return None
+
+
 def get_openai_client():
     if not _HAS_OPENAI:
         return None, "openai-biblioteket saknas (lägg till 'openai' i requirements.txt)."
-    api_key = os.getenv("OPENAI_API_KEY")  # <-- ENDA källan
+    api_key = _get_openai_key()
     if not api_key:
-        return None, "OPENAI_API_KEY saknas (lägg in den i Render Environment)."
+        return None, "OPENAI_API_KEY saknas (lägg in som miljövariabel i Render)."
     try:
         client = OpenAI(api_key=api_key)
         return client, None
     except Exception as e:
         return None, f"Kunde inte initiera OpenAI-klient: {e}"
+
 
 def gpt_match_brief(client, home, away, league, h_form_pts, h_form_gd, a_form_pts, a_form_gd, h_elo, a_elo, p1, px, p2):
     prompt = f"""
@@ -344,7 +397,7 @@ Svara med 3 korta punkter:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "Du skriver kort, sakligt och utan spekulationer."},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             temperature=0.2,
             max_tokens=220,
@@ -353,9 +406,8 @@ Svara med 3 korta punkter:
     except Exception as e:
         return f"(Ingen GPT-analys: {e})"
 
-# =======================
-# Huvudflöde
-# =======================
+
+# ========= Huvudflöde =========
 with st.sidebar:
     st.header("Status")
     st.write("Säsongskod:", SEASON)
@@ -382,6 +434,10 @@ model = load_or_train_model(df_signature, df_prep, feat_cols)
 files_sig = _league_signature(files)
 teams_all = load_or_create_team_labels(df_raw, LEAGUES, files_sig)
 
+# Applicera säsongens låsningar (upp-/nedflyttningar)
+overrides = TEAM_LEAGUE_OVERRIDE.get(SEASON, {})
+teams_all = apply_overrides_to_labels(teams_all, overrides)
+
 if not teams_all:
     st.warning("Kunde inte skapa laglistan. Kontrollera att minst en match finns i varje liga.")
     st.stop()
@@ -391,16 +447,24 @@ with st.sidebar:
     e2_away = set(df_raw.loc[df_raw["League"] == "E2", "AwayTeam"].dropna().astype(str))
     e2_teams = sorted(e2_home | e2_away)
     st.write("Lag:", len(teams_all))
-    # Statusrad för OpenAI – läs endast från env
-    st.write("OPENAI:", "OK" if os.getenv("OPENAI_API_KEY") else "—")
+
+    key_present = bool(_get_openai_key())
+    st.write("OPENAI:", "OK" if key_present else "—")
+    if overrides:
+        with st.expander("Tvingade ligor (låsta upp-/nedflyttningar)", expanded=False):
+            for t, lg in overrides.items():
+                st.write(f"• {t} → {lg}")
     with st.expander("E2-lag (rådata, normaliserat)", expanded=False):
         st.write(", ".join(e2_teams))
 
-n_matches = st.number_input("Antal matcher att tippa", 1, 13, value=13)
-n_half = st.number_input("Antal halvgarderingar", 0, n_matches, value=7)
+# Antal matcher + halvgarderingar
+n_matches = st.number_input("Antal matcher att tippa", min_value=1, max_value=13, value=13, step=1)
+# Default 0, max = n_matches (löser felet du fick)
+n_half = st.number_input("Antal halvgarderingar", min_value=0, max_value=int(n_matches), value=0, step=1)
 
+# Matchval
 match_pairs = []
-for i in range(n_matches):
+for i in range(int(n_matches)):
     c1, c2 = st.columns(2)
     home = c1.selectbox(f"Hemmalag {i+1}", teams_all, key=f"h_{i}")
     away = c2.selectbox(f"Bortalag {i+1}", teams_all, key=f"a_{i}")
@@ -433,7 +497,7 @@ if st.button("Tippa matcher", use_container_width=True):
             float(a_row["AwayFormPts5"].values[0]),
             float(a_row["AwayFormGD5"].values[0]),
             float(h_row["HomeElo"].values[0]),
-            float(a_row["AwayElo"].values[0])
+            float(a_row["AwayElo"].values[0]),
         ]
         probs = predict_probs(model, features, feat_cols)
         match_probs.append(probs)
@@ -459,7 +523,7 @@ if st.button("Tippa matcher", use_container_width=True):
         mapping = {(0, 1): "1X", (0, 2): "12", (1, 2): "X2"}
         return mapping.get(idxs, "1X")
 
-    half_idxs = pick_half_guards(match_probs, n_half)
+    half_idxs = pick_half_guards(match_probs, int(n_half))
 
     for idx, ((home_label, away_label), probs, meta) in enumerate(zip(match_pairs, match_probs, match_meta), start=1):
         if probs is None or len(probs) != 3 or float(np.sum(probs)) == 0.0:
@@ -490,15 +554,13 @@ if st.button("Tippa matcher", use_container_width=True):
         else:
             st.caption("Analysen bygger endast på form/ELO/sannolikheter (inga nyheter för att undvika påhitt).")
             for i, (home_team, away_team, lg, hfp, hfgd, afp, afgd, helo, aelo) in enumerate(match_meta, start=1):
-                if match_probs[i-1] is None or np.sum(match_probs[i-1]) == 0:
+                if match_probs[i - 1] is None or np.sum(match_probs[i - 1]) == 0:
                     st.markdown(f"**{i}) {home_team} ({lg}) - {away_team}**\n*(Ingen data till analys)*")
                     continue
-                    # (medvetet inga extra API-anrop)
-                p1, px, p2 = match_probs[i-1]
+                p1, px, p2 = match_probs[i - 1]
                 try:
                     summary = gpt_match_brief(
-                        client, home_team, away_team, lg,
-                        hfp, hfgd, afp, afgd, helo, aelo, p1, px, p2
+                        client, home_team, away_team, lg, hfp, hfgd, afp, afgd, helo, aelo, p1, px, p2
                     )
                 except Exception as e:
                     summary = f"(Ingen GPT-analys: {e})"
