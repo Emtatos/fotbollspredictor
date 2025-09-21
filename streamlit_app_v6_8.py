@@ -1,9 +1,8 @@
 # streamlit_app_v6_8.py
-# v6.8 — Stabil laglista + normalisering + auto-refresh + föregående säsong
+# v6.8 — Stabil laglista + normalisering + auto-refresh
 # - Laddar E0–E2 (Premier, Championship, League One)
-# - Tar med förra säsongen för att fylla form/ELO i starten
 # - Hanterar namnvarianter (t.ex. "Bradford", "Bradford C" -> "Bradford City")
-# - Rensar och bygger om laglistan när CSV ändras
+# - Rensar och bygger om laglistan när CSV ändras (ingen fastnar i gammal JSON)
 # - Timeout/retries vid nedladdning (app hänger inte)
 # - "Fredagsanalys" via OpenAI (frivilligt)
 
@@ -50,12 +49,7 @@ def season_code():
     prev = y - 1
     return f"{prev:02d}{y:02d}"
 
-def prev_season_code(s: str) -> str:
-    a, b = int(s[:2]), int(s[2:])
-    return f"{a-1:02d}{b-1:02d}"
-
 SEASON = season_code()
-PREV_SEASON = prev_season_code(SEASON)
 
 # =======================
 # Hjälpare
@@ -135,15 +129,14 @@ def _download_one(league: str, s_code: str) -> str | None:
         return None
 
 @st.cache_data(ttl=6*3600, show_spinner=True)
-def download_files(leagues=tuple(LEAGUES), s_codes=(SEASON, PREV_SEASON)):
+def download_files(leagues=tuple(LEAGUES), s_code: str = SEASON):
     paths = []
-    for code in s_codes:
-        for L in leagues:
-            p = _download_one(L, code)
-            if p and os.path.exists(p):
-                paths.append(p)
-            else:
-                st.warning(f"Kunde inte hämta {L} {code} (timeout/blockerat).")
+    for L in leagues:
+        p = _download_one(L, s_code)
+        if p and os.path.exists(p):
+            paths.append(p)
+        else:
+            st.warning(f"Kunde inte hämta {L} {s_code} (timeout/blockerat).")
     if not paths:
         st.error("Ingen liga kunde hämtas. Testa senare eller byt nät.")
     return tuple(paths)
@@ -154,10 +147,8 @@ def load_all_data(files: tuple[str, ...]) -> pd.DataFrame:
     for f in files:
         try:
             df = pd.read_csv(f, encoding="latin1")
-            league, season = os.path.basename(f).split("_")
-            season = season.split(".")[0]
+            league = os.path.basename(f).split("_")[0]
             df["League"] = league
-            df["Season"] = season
             for col in ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]:
                 if col not in df.columns:
                     df[col] = np.nan
@@ -166,12 +157,7 @@ def load_all_data(files: tuple[str, ...]) -> pd.DataFrame:
             dfs.append(df)
         except Exception:
             continue
-    if not dfs:
-        return pd.DataFrame()
-    out = pd.concat(dfs, ignore_index=True)
-    out["Date"] = pd.to_datetime(out["Date"], dayfirst=True, errors="coerce")
-    out = out.sort_values(["League", "Season", "Date"], kind="mergesort").reset_index(drop=True)
-    return out
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 # =======================
 # Features: form + ELO
@@ -273,7 +259,7 @@ def predict_probs(model, features, feature_cols):
     return model.predict_proba(X)[0]
 
 # =======================
-# Laglista
+# Laglista (ALLTID färsk + korrekta namn)
 # =======================
 def _league_signature(files: tuple[str, ...]) -> str:
     parts = []
@@ -315,7 +301,7 @@ def load_or_create_team_labels(df_raw: pd.DataFrame, leagues: list[str], files_s
         except Exception:
             pass
 
-    labels = build_team_labels(df_raw[df_raw["Season"] == SEASON], leagues)  # Bara nuvarande säsong i UI
+    labels = build_team_labels(df_raw, leagues)
     if labels:
         try:
             with open(teams_json, "w", encoding="utf-8") as f:
@@ -329,10 +315,10 @@ def load_or_create_team_labels(df_raw: pd.DataFrame, leagues: list[str], files_s
 # =======================
 def get_openai_client():
     if not _HAS_OPENAI:
-        return None, "openai-biblioteket saknas."
-    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        return None, "openai-biblioteket saknas (lägg till 'openai' i requirements.txt)."
+    api_key = os.getenv("OPENAI_API_KEY")  # <-- ENDA källan
     if not api_key:
-        return None, "OPENAI_API_KEY saknas."
+        return None, "OPENAI_API_KEY saknas (lägg in den i Render Environment)."
     try:
         client = OpenAI(api_key=api_key)
         return client, None
@@ -347,6 +333,11 @@ Använd endast siffrorna nedan (inga påhittade nyheter eller skador):
 - Borta form (5): poäng {a_form_pts:.2f}, målskillnad {a_form_gd:.2f}
 - ELO: {home} {h_elo:.1f}, {away} {a_elo:.1f}
 - Modellens sannolikheter: 1={p1:.1%}, X={px:.1%}, 2={p2:.1%}
+
+Svara med 3 korta punkter:
+1) Styrkebalans (ELO) och hemmaprofil.
+2) Formkurvor (5 matcher) och vad det antyder.
+3) Kort riskbedömning (t.ex. hög osäkerhet om 2 utfall ligger nära).
 """
     try:
         resp = client.chat.completions.create(
@@ -370,29 +361,29 @@ with st.sidebar:
     st.write("Säsongskod:", SEASON)
 
 st.sidebar.write("Hämtar data…")
-files = download_files(tuple(LEAGUES), (PREV_SEASON, SEASON))
+files = download_files(tuple(LEAGUES), SEASON)
 st.sidebar.write("Filer klara:", len(files))
 
 df_raw = load_all_data(files)
 if df_raw.empty:
-    st.error("Ingen data nedladdad.")
+    st.error("Ingen data nedladdad. Kontrollera att football-data.co.uk är uppe eller testa senare.")
     st.stop()
 
-df_prep_all, feat_cols = prepare_features(df_raw)
+df_prep, feat_cols = prepare_features(df_raw)
 if not feat_cols:
-    st.error("Kunde inte förbereda features.")
+    st.error("Kunde inte förbereda features (saknas FTR eller bas-kolumner).")
     st.stop()
 
-latest_ts = int(pd.to_datetime(df_prep_all["Date"], errors="coerce").max().timestamp()) if "Date" in df_prep_all.columns else 0
-df_signature = (len(df_prep_all), latest_ts)
+latest_ts = int(pd.to_datetime(df_prep["Date"], errors="coerce").max().timestamp()) if "Date" in df_prep.columns else 0
+df_signature = (len(df_prep), latest_ts)
 
-model = load_or_train_model(df_signature, df_prep_all, feat_cols)
+model = load_or_train_model(df_signature, df_prep, feat_cols)
 
 files_sig = _league_signature(files)
 teams_all = load_or_create_team_labels(df_raw, LEAGUES, files_sig)
 
 if not teams_all:
-    st.warning("Kunde inte skapa laglistan.")
+    st.warning("Kunde inte skapa laglistan. Kontrollera att minst en match finns i varje liga.")
     st.stop()
 
 with st.sidebar:
@@ -400,7 +391,8 @@ with st.sidebar:
     e2_away = set(df_raw.loc[df_raw["League"] == "E2", "AwayTeam"].dropna().astype(str))
     e2_teams = sorted(e2_home | e2_away)
     st.write("Lag:", len(teams_all))
-    st.write("OPENAI:", "OK" if (st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")) else "—")
+    # Statusrad för OpenAI – läs endast från env
+    st.write("OPENAI:", "OK" if os.getenv("OPENAI_API_KEY") else "—")
     with st.expander("E2-lag (rådata, normaliserat)", expanded=False):
         st.write(", ".join(e2_teams))
 
@@ -427,8 +419,8 @@ if st.button("Tippa matcher", use_container_width=True):
         home_team = normalize_team_name(home_team)
         away_team = normalize_team_name(away_team)
 
-        h_row = df_prep_all[(df_prep_all["League"] == home_lg) & (df_prep_all["HomeTeam"] == home_team)].tail(1)
-        a_row = df_prep_all[(df_prep_all["League"] == away_lg) & (df_prep_all["AwayTeam"] == away_team)].tail(1)
+        h_row = df_prep[(df_prep["League"] == home_lg) & (df_prep["HomeTeam"] == home_team)].tail(1)
+        a_row = df_prep[(df_prep["League"] == away_lg) & (df_prep["AwayTeam"] == away_team)].tail(1)
 
         if h_row.empty or a_row.empty:
             match_probs.append(np.array([0.0, 0.0, 0.0]))
@@ -496,11 +488,12 @@ if st.button("Tippa matcher", use_container_width=True):
         if err:
             st.warning(err)
         else:
-            st.caption("Analysen bygger endast på form/ELO/sannolikheter.")
+            st.caption("Analysen bygger endast på form/ELO/sannolikheter (inga nyheter för att undvika påhitt).")
             for i, (home_team, away_team, lg, hfp, hfgd, afp, afgd, helo, aelo) in enumerate(match_meta, start=1):
                 if match_probs[i-1] is None or np.sum(match_probs[i-1]) == 0:
                     st.markdown(f"**{i}) {home_team} ({lg}) - {away_team}**\n*(Ingen data till analys)*")
                     continue
+                    # (medvetet inga extra API-anrop)
                 p1, px, p2 = match_probs[i-1]
                 try:
                     summary = gpt_match_brief(
