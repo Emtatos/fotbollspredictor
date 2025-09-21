@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: fotboll-v68
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run streamlit_app_v6_8.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
