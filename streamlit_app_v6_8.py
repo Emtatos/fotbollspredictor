@@ -72,27 +72,44 @@ def _hash_file(path: str) -> str:
 def _norm_space(s: str) -> str:
     return " ".join(str(s).strip().split())
 
-# Football-Data → standardnamn
+def _unify_dash(s: str) -> str:
+    # Tolka – (en-dash), — (em-dash) och − (minus) som bindestreck
+    return re.sub(r"[–—−]", "-", s)
+
+# Football-Data → standardnamn (inkl. vanliga kortformer)
 TEAM_ALIASES = {
     "Bradford": "Bradford City",
     "Bradford C": "Bradford City",
     "Bradford City": "Bradford City",
+
     "Cardiff": "Cardiff City",
     "Cardiff C": "Cardiff City",
     "Cardiff City": "Cardiff City",
+
     "Man United": "Manchester United",
     "Man Utd": "Manchester United",
     "Man City": "Manchester City",
+
     "Sheffield Wed": "Sheffield Wednesday",
     "Sheff Wed": "Sheffield Wednesday",
     "Sheffield Utd": "Sheffield United",
     "Sheff Utd": "Sheffield United",
+
     "QPR": "Queens Park Rangers",
+    "Queens Park Rangers": "Queens Park Rangers",
+
     "MK Dons": "Milton Keynes Dons",
+
+    # Wolves / Forest-varianter
     "Wolves": "Wolverhampton Wanderers",
     "Wolverhampton": "Wolverhampton Wanderers",
-    "Nottingham": "Nottingham Forest",
+    "Wolverhampton W": "Wolverhampton Wanderers",
+    "Wolverhampton Wanderers": "Wolverhampton Wanderers",
+
+    "Nott'm Forest": "Nottingham Forest",
+    "Nottm Forest": "Nottingham Forest",
     "Nottingham F": "Nottingham Forest",
+    "Nottingham": "Nottingham Forest",
     "Nottingham Forest": "Nottingham Forest",
 }
 
@@ -109,17 +126,14 @@ def _safe_secret(key: str) -> Optional[str]:
     """
     SÄKER hemlighetshämtning.
     - Försök env först (Render/Heroku m.fl.)
-    - Försök st.secrets endast om det finns och är laddat, och använd `in` för att undvika parse-fel
-    - Returnerar None om inget hittas
+    - Försök st.secrets endast om det finns och är laddat, använd 'in' för att undvika parse-fel.
     """
     val = os.getenv(key)
     if val:
         return val
     try:
-        if hasattr(st, "secrets"):
-            # Viktigt: använd 'in' i stället för get()
-            if key in st.secrets:
-                return st.secrets[key]
+        if hasattr(st, "secrets") and (key in st.secrets):
+            return st.secrets[key]
     except Exception:
         pass
     return None
@@ -434,7 +448,7 @@ def _extract_league_tag(text: str) -> Tuple[str, Optional[str]]:
 
 def parse_manual_lines(s: str, expected_n: int) -> List[Tuple[str, str, Optional[str]]]:
     """
-    Tar tex:
+    Exempel:
       "Fulham - Brentford"
       "Man United (E0) - Chelsea"
       "Derby - Preston (E1)"
@@ -442,7 +456,7 @@ def parse_manual_lines(s: str, expected_n: int) -> List[Tuple[str, str, Optional
     """
     out = []
     for raw in s.splitlines():
-        line = raw.strip()
+        line = _unify_dash(raw.strip())  # <— viktig fix: tolka –/—/− som '-'
         if not line:
             continue
         line, tag = _extract_league_tag(line)
@@ -681,7 +695,7 @@ if st.button("Tippa matcher", use_container_width=True):
     # Halvgarderingar
     half_idxs = _pick_half_guards(match_probs, int(n_half))
 
-    # Tabell (förenklad, robust)
+    # Tabell
     for idx in range(1, len(pairs_to_use) + 1):
         home_label, away_label, _ = pairs_to_use[idx - 1]
         probs = match_probs[idx - 1]
@@ -725,7 +739,6 @@ if st.button("Tippa matcher", use_container_width=True):
                     st.markdown(f"**{i}) {home_team} ({lg}) - {away_team}**")
                     st.write(summary)
                 else:
-                    # Ingen E0–E2-data → försiktig GPT-fallback om nyckel finns
                     if _has_openai_key():
                         fallback = gpt_predict_for_unknown(client, home_team, away_team)
                     else:
