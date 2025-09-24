@@ -92,6 +92,7 @@ TEAM_ALIASES = {
 
     "Sheffield Wed": "Sheffield Wednesday",
     "Sheff Wed": "Sheffield Wednesday",
+    "Sheffield Wed.": "Sheffield Wednesday",
     "Sheffield Utd": "Sheffield United",
     "Sheff Utd": "Sheffield United",
 
@@ -456,7 +457,7 @@ def parse_manual_lines(s: str, expected_n: int) -> List[Tuple[str, str, Optional
     """
     out = []
     for raw in s.splitlines():
-        line = _unify_dash(raw.strip())  # <— viktig fix: tolka –/—/− som '-'
+        line = _unify_dash(raw.strip())  # —/–/− → '-'
         if not line:
             continue
         line, tag = _extract_league_tag(line)
@@ -607,53 +608,26 @@ else:
     st.info(f"Upptäckte {len(manual_pairs)} manuella rader (av {n_matches}). Tomma/felaktiga rader ignoreras.")
 
 # =======================
-#   Match → features
+#   Snapshot-hjälpare (NY)
 # =======================
-def _latest_rows_for_match(df_feat: pd.DataFrame,
-                           home: str, away: str,
-                           league_hint: Optional[str]) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[str]]:
+def _team_snapshot(df_feat: pd.DataFrame, team: str, league_hint: Optional[str]) -> Optional[Tuple[float, float, float, str]]:
     """
-    Hitta senaste rader (en rad vardera) för hemmasidan resp. bortasidan.
-    Om league_hint (E0/E1/E2) ges filtrerar vi mot den ligan.
-    Returnerar (h_row, a_row, league_used)
+    Hämtar senaste *valfri* matchrad för laget (hemma eller borta).
+    Returnerar (form_pts, form_gd, elo, league_used) eller None om inget hittas.
     """
-    df = df_feat
-    if league_hint:
-        df = df[df["League"] == league_hint]
-
-    h_row = df[(df["HomeTeam"] == home)].sort_values("Date").tail(1)
-    a_row = df[(df["AwayTeam"] == away)].sort_values("Date").tail(1)
-
-    if (h_row.empty or a_row.empty) and league_hint:
-        df2 = df_feat
-        h2 = df2[(df2["HomeTeam"] == home)].sort_values("Date").tail(1)
-        a2 = df2[(df2["AwayTeam"] == away)].sort_values("Date").tail(1)
-        if not h2.empty and not a2.empty:
-            return h2.iloc[0], a2.iloc[0], league_hint
-    if not h_row.empty and not a_row.empty:
-        used = league_hint if league_hint else (h_row.iloc[0]["League"] if pd.notna(h_row.iloc[0]["League"]) else None)
-        return h_row.iloc[0], a_row.iloc[0], used
-    return None, None, league_hint
-
-def _pick_half_guards(match_probs: List[Optional[np.ndarray]], n_half: int) -> set:
-    if n_half <= 0:
-        return set()
-    margins = []
-    for i, p in enumerate(match_probs):
-        if p is None or len(p) != 3 or np.sum(p) == 0:
-            margins.append((i, 1.0))
-            continue
-        s = np.sort(p)
-        margin = s[-1] - s[-2]
-        margins.append((i, margin))
-    margins.sort(key=lambda x: x[1])
-    return {i for i, _ in margins[:n_half]}
-
-def _halfguard_sign(probs: np.ndarray) -> str:
-    idxs = np.argsort(probs)[-2:]
-    idxs = tuple(sorted(map(int, idxs)))
-    mapping = {(0, 1): "1X", (0, 2): "12", (1, 2): "X2"}
-    return mapping.get(idxs, "1X")
+    df = df_feat if not league_hint else df_feat[df_feat["League"] == league_hint]
+    sub = df[(df["HomeTeam"] == team) | (df["AwayTeam"] == team)].sort_values("Date")
+    if sub.empty and league_hint:
+        sub = df_feat[(df_feat["HomeTeam"] == team) | (df_feat["AwayTeam"] == team)].sort_values("Date")
+    if sub.empty:
+        return None
+    row = sub.tail(1).iloc[0]
+    if row["HomeTeam"] == team:
+        pts = float(row["HomeFormPts5"]); gd = float(row["HomeFormGD5"]); elo = float(row["HomeElo"])
+    else:
+        pts = float(row["AwayFormPts5"]); gd = float(row["AwayFormGD5"]); elo = float(row["AwayElo"])
+    lg = str(row["League"]) if "League" in row and pd.notna(row["League"]) else (league_hint or "—")
+    return pts, gd, elo, lg
 
 # =======================
 #   Körning
@@ -670,27 +644,22 @@ if st.button("Tippa matcher", use_container_width=True):
         pairs_to_use = []  # användaren får korrigera texten
 
     for (home, away, lg_hint) in pairs_to_use:
-        h_row, a_row, used_lg = _latest_rows_for_match(df_prep, home, away, lg_hint)
+        hs = _team_snapshot(df_prep, home, lg_hint)
+        as_ = _team_snapshot(df_prep, away, lg_hint)
 
-        if (h_row is None) or (a_row is None):
+        if (hs is None) or (as_ is None):
             match_probs.append(None)
-            match_meta.append((home, away, used_lg or "—", 0, 0, 0, 0, 0, 0))
+            match_meta.append((home, away, lg_hint or "—", 0, 0, 0, 0, 0, 0))
             continue
 
-        features = [
-            float(h_row["HomeFormPts5"]),
-            float(h_row["HomeFormGD5"]),
-            float(a_row["AwayFormPts5"]),
-            float(a_row["AwayFormGD5"]),
-            float(h_row["HomeElo"]),
-            float(a_row["AwayElo"]),
-        ]
+        hfp, hfgd, helo, hlg = hs
+        afp, afgd, aelo, alg = as_
+        used_lg = lg_hint or hlg or alg or "—"
+
+        features = [hfp, hfgd, afp, afgd, helo, aelo]
         probs = predict_probs(model, features, feat_cols)
         match_probs.append(probs)
-        match_meta.append(
-            (home, away, used_lg or str(h_row.get("League", "—")),
-             features[0], features[1], features[2], features[3], features[4], features[5])
-        )
+        match_meta.append((home, away, used_lg, hfp, hfgd, afp, afgd, helo, aelo))
 
     # Halvgarderingar
     half_idxs = _pick_half_guards(match_probs, int(n_half))
@@ -699,25 +668,29 @@ if st.button("Tippa matcher", use_container_width=True):
     for idx in range(1, len(pairs_to_use) + 1):
         home_label, away_label, _ = pairs_to_use[idx - 1]
         probs = match_probs[idx - 1]
+        meta = match_meta[idx - 1]
 
         if (probs is None) or (len(probs) != 3) or float(np.sum(probs)) == 0.0:
-            tecken, pct = "(X)", ""
+            tecken, pct, stats = "(X)", "", ""
         else:
             if (idx - 1) in half_idxs:
                 tecken, pct = f"({_halfguard_sign(probs)})", "-"
             else:
                 pred = int(np.argmax(probs))
                 tecken, pct = f"({['1','X','2'][pred]})", f"{probs[pred]*100:.1f}%"
+            # Stats: ELOΔ
+            _, _, _, _, _, _, _, helo, aelo = meta
+            stats = f"ELOΔ {helo - aelo:+.0f}"
 
-        rows.append([idx, "", f"{home_label} - {away_label}", tecken, "", "", pct])
-        tecken_list.append(tecken)
+        rows.append([idx, "", f"{home_label} - {away_label}", tecken, "", "", pct, stats])
 
-    df_out = pd.DataFrame(rows, columns=["#", "Status", "Match", "Tecken", "Res.", "%", "Stats"])
+    df_out = pd.DataFrame(rows, columns=["#", "Status", "Match", "Tecken", "Res.", "%", "Stats", "Nyckel"])
+    df_out = df_out.drop(columns=["Nyckel"])  # bara för kolumnordning-trick
     st.subheader("Resultat-tabell")
     st.dataframe(df_out, use_container_width=True)
 
     st.subheader("Tipsrad (kopiera)")
-    st.code(" ".join(tecken_list), language=None)
+    st.code(" ".join(tecken_list if tecken_list else [r[3] for r in rows]), language=None)
 
     # Fredagsanalys
     with st.expander("🔮 Fredagsanalys (GPT)"):
