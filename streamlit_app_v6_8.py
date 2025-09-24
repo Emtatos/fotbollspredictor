@@ -15,6 +15,7 @@ import re
 import json
 import time
 import glob
+import math
 import hashlib
 from pathlib import Path
 from datetime import datetime
@@ -472,6 +473,65 @@ def parse_manual_lines(s: str, expected_n: int) -> List[Tuple[str, str, Optional
     return out
 
 # =======================
+#   Guards (återinsatta)
+# =======================
+def _extract_probs_generic(p) -> List[float]:
+    """Accepterar (p1, px, p2) eller dict med valfria nycklar."""
+    if isinstance(p, dict):
+        def get_any(d, keys, default=0.0):
+            for k in keys:
+                if k in d:
+                    return float(d[k])
+            return default
+        ph = get_any(p, ('1','H','home','Home','HOME'))
+        px = get_any(p, ('X','D','draw','Draw','DRAW'))
+        pa = get_any(p, ('2','A','away','Away','AWAY'))
+        probs = [ph, px, pa]
+    else:
+        probs = list(p)
+
+    probs = [max(1e-12, float(x)) for x in probs[:3]]
+    s = sum(probs)
+    if s <= 0:
+        probs = [1/3, 1/3, 1/3]
+    else:
+        probs = [x/s for x in probs]
+    return probs
+
+def _pick_half_guards(match_probs: List[Optional[np.ndarray]], n_half: int) -> List[int]:
+    """
+    Välj index (0-baserat) för halvgarderingar bland matcherna.
+    Strategi: välj de mest osäkra matcherna – minst skillnad mellan bästa och näst bästa utfall.
+    """
+    if not match_probs or n_half <= 0:
+        return []
+    scored = []
+    for i, p in enumerate(match_probs):
+        if p is None:
+            # Saknar data → relativt osäker; ge hög prioritet
+            scored.append((0.0, 0.0, i))
+            continue
+        probs = _extract_probs_generic(p)
+        a, b, c = sorted(probs, reverse=True)
+        margin = a - b
+        entropy = -sum(q*math.log(q) for q in probs)
+        scored.append((margin, -entropy, i))
+    scored.sort(key=lambda t: (t[0], t[1]))  # minst margin först
+    k = min(int(n_half), len(scored))
+    return [i for _, __, i in scored[:k]]
+
+def _halfguard_sign(probs_like) -> str:
+    """
+    Returnera halvgardering som sträng: '1X', 'X2' eller '12' genom att
+    ta bort det minst sannolika utfallet.
+    """
+    probs = _extract_probs_generic(probs_like)
+    mapping = {0: '1', 1: 'X', 2: '2'}
+    least = int(np.argmin(probs))
+    keep = [mapping[i] for i in range(3) if i != least]
+    return "".join(keep)
+
+# =======================
 #   UI – sidomeny
 # =======================
 with st.sidebar:
@@ -608,7 +668,7 @@ else:
     st.info(f"Upptäckte {len(manual_pairs)} manuella rader (av {n_matches}). Tomma/felaktiga rader ignoreras.")
 
 # =======================
-#   Snapshot-hjälpare (NY)
+#   Snapshot-hjälpare
 # =======================
 def _team_snapshot(df_feat: pd.DataFrame, team: str, league_hint: Optional[str]) -> Optional[Tuple[float, float, float, str]]:
     """
@@ -664,33 +724,37 @@ if st.button("Tippa matcher", use_container_width=True):
     # Halvgarderingar
     half_idxs = _pick_half_guards(match_probs, int(n_half))
 
-    # Tabell
+    # Tabell + tipsrad
     for idx in range(1, len(pairs_to_use) + 1):
         home_label, away_label, _ = pairs_to_use[idx - 1]
         probs = match_probs[idx - 1]
         meta = match_meta[idx - 1]
 
         if (probs is None) or (len(probs) != 3) or float(np.sum(probs)) == 0.0:
-            tecken, pct, stats = "(X)", "", ""
+            sign_display, pct, elo_delta = "(X)", "", ""
+            tecken_list.append("(X)")
         else:
             if (idx - 1) in half_idxs:
-                tecken, pct = f"({_halfguard_sign(probs)})", "-"
+                hg = _halfguard_sign(probs)
+                sign_display, pct = f"({hg})", "-"
+                tecken_list.append(f"({hg})")
             else:
                 pred = int(np.argmax(probs))
-                tecken, pct = f"({['1','X','2'][pred]})", f"{probs[pred]*100:.1f}%"
+                sign = ['1','X','2'][pred]
+                sign_display, pct = f"({sign})", f"{probs[pred]*100:.1f}%"
+                tecken_list.append(f"({sign})")
             # Stats: ELOΔ
             _, _, _, _, _, _, _, helo, aelo = meta
-            stats = f"ELOΔ {helo - aelo:+.0f}"
+            elo_delta = f"{helo - aelo:+.0f}"
 
-        rows.append([idx, "", f"{home_label} - {away_label}", tecken, "", "", pct, stats])
+        rows.append([idx, f"{home_label} - {away_label}", sign_display, pct, elo_delta])
 
-    df_out = pd.DataFrame(rows, columns=["#", "Status", "Match", "Tecken", "Res.", "%", "Stats", "Nyckel"])
-    df_out = df_out.drop(columns=["Nyckel"])  # bara för kolumnordning-trick
+    df_out = pd.DataFrame(rows, columns=["#", "Match", "Tecken", "%", "ELOΔ"])
     st.subheader("Resultat-tabell")
     st.dataframe(df_out, use_container_width=True)
 
     st.subheader("Tipsrad (kopiera)")
-    st.code(" ".join(tecken_list if tecken_list else [r[3] for r in rows]), language=None)
+    st.code(" ".join(tecken_list), language=None)
 
     # Fredagsanalys
     with st.expander("🔮 Fredagsanalys (GPT)"):
